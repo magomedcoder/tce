@@ -21,6 +21,8 @@ pub enum Key {
     CtrlS,
     CtrlQ,
     CtrlB,
+    CtrlL,
+    CtrlK,
     CtrlN,
     Esc,
 }
@@ -60,6 +62,14 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
 
         if byte == 2 {
             return Ok(Some(Key::CtrlB));
+        }
+
+        if byte == 12 {
+            return Ok(Some(Key::CtrlL));
+        }
+
+        if byte == 11 {
+            return Ok(Some(Key::CtrlK));
         }
 
         if byte == 14 {
@@ -123,6 +133,15 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         return Ok(Some(Key::Esc));
     }
 
+    // Some terminals can prepend an extra ESC byte
+    while seq.first() == Some(&0x1b) {
+        seq.remove(0);
+    }
+
+    if seq.is_empty() {
+        return Ok(Some(Key::Esc));
+    }
+
     if seq[0] == b'O' && seq.len() >= 2 {
         return Ok(Some(match seq[1] {
             b'A' => Key::ArrowUp,
@@ -131,12 +150,12 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             b'D' => Key::ArrowLeft,
             b'H' => Key::Home,
             b'F' => Key::End,
-            _ => Key::Esc,
+            _ => return Ok(None),
         }));
     }
 
     if seq[0] != b'[' {
-        return Ok(Some(Key::Esc));
+        return Ok(None);
     }
 
     let body = &seq[1..];
@@ -157,11 +176,25 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         b'F' => return Ok(Some(Key::End)),
         _ => {}
     }
+
+    // Handle CSI sequences like ESC [ 1 ; 5 A
+    if let Some(last) = body.last().copied() {
+        match last {
+            b'A' => return Ok(Some(Key::ArrowUp)),
+            b'B' => return Ok(Some(Key::ArrowDown)),
+            b'C' => return Ok(Some(Key::ArrowRight)),
+            b'D' => return Ok(Some(Key::ArrowLeft)),
+            b'H' => return Ok(Some(Key::Home)),
+            b'F' => return Ok(Some(Key::End)),
+            _ => {}
+        }
+    }
+
     if body.len() >= 2 && *body.last().unwrap_or(&0) == b'~' {
         let lead = body[0];
         match lead {
             b'1' | b'7' => return Ok(Some(Key::Home)),
-            b'2' => return Ok(Some(Key::Esc)),
+            b'2' => return Ok(None),
             b'3' => return Ok(Some(Key::Delete)),
             b'4' | b'8' => return Ok(Some(Key::End)),
             b'5' => return Ok(Some(Key::PageUp)),
@@ -169,5 +202,5 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             _ => {}
         }
     }
-    Ok(Some(Key::Esc))
+    Ok(None)
 }

@@ -7,6 +7,8 @@ mod document;
 #[cfg(unix)]
 mod keys;
 #[cfg(unix)]
+mod localization;
+#[cfg(unix)]
 mod recents;
 #[cfg(unix)]
 mod terminal;

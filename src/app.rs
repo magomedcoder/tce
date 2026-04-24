@@ -52,8 +52,10 @@ impl App {
 
                         match w.handle_key(key)? {
                             WelcomeAction::Quit => break,
-                            WelcomeAction::OpenProject(root) => {
-                                self.phase = Phase::Workspace(Workspace::open_project(root)?);
+                            WelcomeAction::OpenProject(root, language) => {
+                                let mut ws = Workspace::open_project(root)?;
+                                ws.set_language(language);
+                                self.phase = Phase::Workspace(ws);
                             }
                             WelcomeAction::None => {}
                         }

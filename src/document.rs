@@ -206,7 +206,7 @@ impl Document {
                 self.row = (self.row + step).min(self.buffer.line_count().saturating_sub(1));
                 self.col = self.col.min(self.buffer.line_len_chars(self.row));
             }
-            Key::Esc | Key::ShiftTab | Key::CtrlB | Key::CtrlN => {}
+            Key::Esc | Key::ShiftTab | Key::CtrlB | Key::CtrlL | Key::CtrlK | Key::CtrlN => {}
         }
         self.force_quit_pending = false;
         Ok(false)
