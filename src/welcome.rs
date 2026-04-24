@@ -128,19 +128,10 @@ impl Welcome {
     pub fn handle_key(&mut self, key: Key) -> io::Result<WelcomeAction> {
         if self.language_picker {
             match key {
-                Key::Esc => {
-                    self.language_picker = false;
-                }
                 Key::ArrowUp => {
                     self.language_sel = self.language_sel.saturating_sub(1);
                 }
                 Key::ArrowDown => {
-                    self.language_sel = (self.language_sel + 1).min(1);
-                }
-                Key::Char('k') | Key::Char('K') => {
-                    self.language_sel = self.language_sel.saturating_sub(1);
-                }
-                Key::Char('j') | Key::Char('J') => {
                     self.language_sel = (self.language_sel + 1).min(1);
                 }
                 Key::Enter => {
@@ -151,6 +142,9 @@ impl Welcome {
                     };
                     self.language_picker = false;
                 }
+                Key::CtrlL => {
+                    self.language_picker = false;
+                }
                 Key::CtrlQ => return Ok(WelcomeAction::Quit),
                 _ => {}
             }
@@ -159,7 +153,7 @@ impl Welcome {
 
         if self.hotkeys_help {
             match key {
-                Key::Esc | Key::CtrlK => {
+                Key::CtrlK => {
                     self.hotkeys_help = false;
                 }
                 Key::CtrlQ => return Ok(WelcomeAction::Quit),
@@ -173,11 +167,6 @@ impl Welcome {
                 _ if self.path_input.is_some() => {
                     let mut buf = self.path_input.take().unwrap_or_default();
                     match key {
-                        Key::Esc => {
-                            self.path_input = None;
-                            self.path_suggestions.clear();
-                            self.path_suggestion_sel = 0;
-                        }
                         Key::Backspace => {
                             buf.pop();
                             self.path_input = Some(buf);
@@ -226,6 +215,9 @@ impl Welcome {
                             self.path_suggestions.clear();
                             self.path_suggestion_sel = 0;
                         }
+                        Key::CtrlN | Key::CtrlQ | Key::CtrlL | Key::CtrlK => {
+                            self.path_input = Some(buf);
+                        }
                         Key::Char(ch) => {
                             buf.push(ch);
                             self.path_input = Some(buf);
@@ -237,17 +229,17 @@ impl Welcome {
                     }
                     return Ok(WelcomeAction::None);
                 }
-                Key::Esc | Key::CtrlN | Key::Char('n') | Key::Char('N') => {
+                Key::CtrlN | Key::Char('n') | Key::Char('N') => {
                     self.folder_browser = false;
                     self.path_input = None;
                     self.path_suggestions.clear();
                     self.path_suggestion_sel = 0;
                 }
-                Key::ArrowUp | Key::Char('k') | Key::Char('K') => {
+                Key::ArrowUp => {
                     self.browse_sel = self.browse_sel.saturating_sub(1);
                     self.adjust_browse_scroll();
                 }
-                Key::ArrowDown | Key::Char('j') | Key::Char('J') => {
+                Key::ArrowDown => {
                     if self.browse_sel + 1 < self.browse_items.len() {
                         self.browse_sel += 1;
                     }
@@ -337,14 +329,6 @@ impl Welcome {
                 }
             }
             Key::ArrowDown => {
-                if self.selected + 1 < self.recents.len() {
-                    self.selected += 1;
-                }
-            }
-            Key::Char('k') | Key::Char('K') => {
-                self.selected = self.selected.saturating_sub(1);
-            }
-            Key::Char('j') | Key::Char('J') => {
                 if self.selected + 1 < self.recents.len() {
                     self.selected += 1;
                 }

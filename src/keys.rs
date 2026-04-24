@@ -1,4 +1,4 @@
-use std::io::{self, Read};
+use std::io;
 
 use crate::terminal::read_timeout;
 
@@ -28,12 +28,10 @@ pub enum Key {
 }
 
 pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
-    let mut b0 = [0u8; 1];
-    let n = std::io::stdin().read(&mut b0)?;
-    if n == 0 {
-        return Ok(None);
-    }
-    let byte = b0[0];
+    let byte = match read_one_byte(stdin_fd)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
 
     if byte == 0x1b {
         return parse_escape(stdin_fd);
@@ -86,11 +84,11 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
 
     let mut buf = [0u8; 4];
     buf[0] = byte;
-    if let Err(e) = std::io::stdin().read_exact(&mut buf[1..needed]) {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            return Ok(Some(Key::Char('\u{fffd}')));
+    for i in 1..needed {
+        match read_one_byte(stdin_fd)? {
+            Some(b) => buf[i] = b,
+            None => return Ok(Some(Key::Char('\u{fffd}'))),
         }
-        return Err(e);
     }
 
     let ch = std::str::from_utf8(&buf[..needed])
@@ -98,6 +96,20 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         .and_then(|s| s.chars().next())
         .unwrap_or('\u{fffd}');
     Ok(Some(Key::Char(ch)))
+}
+
+fn read_one_byte(fd: std::os::unix::io::RawFd) -> io::Result<Option<u8>> {
+    let mut b = [0u8; 1];
+    let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), 1) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if n == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(b[0]))
 }
 
 fn utf8_char_len(b: u8) -> usize {
@@ -117,8 +129,12 @@ fn utf8_char_len(b: u8) -> usize {
 fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     let mut seq = Vec::<u8>::new();
     let mut scratch = [0u8; 64];
-    for _ in 0..4 {
-        let n = read_timeout(stdin_fd, &mut scratch, 50)?;
+    // First byte after ESC can arrive much later in some terminals/tmux setups
+    let mut first_wait = true;
+    for _ in 0..6 {
+        let timeout_ms = if first_wait { 700 } else { 80 };
+        let n = read_timeout(stdin_fd, &mut scratch, timeout_ms)?;
+        first_wait = false;
         if n == 0 {
             break;
         }
@@ -152,6 +168,9 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             b'F' => Key::End,
             _ => return Ok(None),
         }));
+    } else if seq[0] == b'O' {
+        // Incomplete SS3 sequence: ignore this key
+        return Ok(None);
     }
 
     if seq[0] != b'[' {
@@ -160,7 +179,8 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
 
     let body = &seq[1..];
     if body.is_empty() {
-        return Ok(Some(Key::Esc));
+        // Incomplete CSI sequence (often from arrows split across reads): ignore
+        return Ok(None);
     }
 
     if body[0] == b'Z' {

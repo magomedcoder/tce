@@ -248,7 +248,7 @@ impl Workspace {
     pub fn handle_key(&mut self, key: Key) -> io::Result<bool> {
         if self.hotkeys_help {
             match key {
-                Key::Esc | Key::CtrlK => {
+                Key::CtrlK => {
                     self.hotkeys_help = false;
                 }
                 Key::CtrlQ => return self.doc.handle_key(key),
@@ -259,19 +259,10 @@ impl Workspace {
 
         if self.language_picker {
             match key {
-                Key::Esc => {
-                    self.language_picker = false;
-                }
                 Key::ArrowUp => {
                     self.language_sel = self.language_sel.saturating_sub(1);
                 }
                 Key::ArrowDown => {
-                    self.language_sel = (self.language_sel + 1).min(1);
-                }
-                Key::Char('k') | Key::Char('K') => {
-                    self.language_sel = self.language_sel.saturating_sub(1);
-                }
-                Key::Char('j') | Key::Char('J') => {
                     self.language_sel = (self.language_sel + 1).min(1);
                 }
                 Key::Enter => {
@@ -280,6 +271,9 @@ impl Workspace {
                     } else {
                         Language::Ru
                     };
+                    self.language_picker = false;
+                }
+                Key::CtrlL => {
                     self.language_picker = false;
                 }
                 Key::CtrlQ => return self.doc.handle_key(key),
