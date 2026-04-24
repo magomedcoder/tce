@@ -1,11 +1,11 @@
-//! Unix TTY: raw mode, window size, restore on drop.
+//! Unix TTY: raw mode, window size, restore on drop
 #![cfg(unix)]
 
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
-/// Rows and columns of the terminal window (character cells).
+/// Rows and columns of the terminal window (character cells)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TermSize {
     pub rows: u16,
@@ -30,7 +30,7 @@ fn winsize_fd(fd: std::os::unix::io::RawFd) -> io::Result<TermSize> {
     }
 }
 
-/// Restores cooked mode when dropped (including on panic unwind).
+/// Restores cooked mode when dropped (including on panic unwind)
 pub struct RawMode {
     fd: std::os::unix::io::RawFd,
     saved: libc::termios,

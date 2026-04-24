@@ -1,9 +1,21 @@
 #[cfg(unix)]
+mod app;
+#[cfg(unix)]
 mod buffer;
 #[cfg(unix)]
-mod editor;
+mod document;
+#[cfg(unix)]
+mod keys;
+#[cfg(unix)]
+mod recents;
 #[cfg(unix)]
 mod terminal;
+#[cfg(unix)]
+mod tree;
+#[cfg(unix)]
+mod welcome;
+#[cfg(unix)]
+mod workspace;
 
 #[cfg(not(unix))]
 fn main() {
@@ -14,9 +26,9 @@ fn main() {
 #[cfg(unix)]
 fn main() {
     let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
-    match editor::Editor::new(path) {
-        Ok(mut ed) => {
-            if let Err(e) = ed.run() {
+    match app::App::from_args(path) {
+        Ok(mut app) => {
+            if let Err(e) = app.run() {
                 eprintln!("error: {e}");
                 std::process::exit(1);
             }
