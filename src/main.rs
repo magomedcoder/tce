@@ -11,6 +11,10 @@ mod localization;
 #[cfg(unix)]
 mod recents;
 #[cfg(unix)]
+mod session;
+#[cfg(unix)]
+mod settings;
+#[cfg(unix)]
 mod terminal;
 #[cfg(unix)]
 mod tree;

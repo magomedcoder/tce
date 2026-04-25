@@ -6,6 +6,16 @@ use crate::buffer::Buffer;
 use crate::keys::Key;
 use crate::terminal::{winsize_tty, TermSize};
 
+#[derive(Clone)]
+struct Snapshot {
+    text: String,
+    row: usize,
+    col: usize,
+    scroll_row: usize,
+    hscroll: usize,
+    dirty: bool,
+}
+
 pub struct Document {
     pub buffer: Buffer,
     pub row: usize,
@@ -14,7 +24,10 @@ pub struct Document {
     pub hscroll: usize,
     pub path: Option<PathBuf>,
     pub dirty: bool,
+    pub pinned: bool,
     pub force_quit_pending: bool,
+    undo_stack: Vec<Snapshot>,
+    redo_stack: Vec<Snapshot>,
 }
 
 impl Document {
@@ -27,7 +40,10 @@ impl Document {
             hscroll: 0,
             path: None,
             dirty: false,
+            pinned: false,
             force_quit_pending: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -41,21 +57,62 @@ impl Document {
             hscroll: 0,
             path: Some(path),
             dirty: false,
+            pinned: false,
             force_quit_pending: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         })
     }
 
-    pub fn load_file(&mut self, path: PathBuf) -> io::Result<()> {
-        let text = fs::read_to_string(&path)?;
-        self.buffer = Buffer::from_file(&text);
-        self.path = Some(path);
-        self.row = 0;
-        self.col = 0;
-        self.scroll_row = 0;
-        self.hscroll = 0;
-        self.dirty = false;
-        self.force_quit_pending = false;
-        Ok(())
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            text: self.buffer.to_file_string(),
+            row: self.row,
+            col: self.col,
+            scroll_row: self.scroll_row,
+            hscroll: self.hscroll,
+            dirty: self.dirty,
+        }
+    }
+
+    fn restore_from_snapshot(&mut self, snap: Snapshot) {
+        self.buffer = Buffer::from_file(&snap.text);
+        self.row = snap.row;
+        self.col = snap.col;
+        self.scroll_row = snap.scroll_row;
+        self.hscroll = snap.hscroll;
+        self.dirty = snap.dirty;
+        self.clamp_cursor();
+    }
+
+    fn push_undo_snapshot(&mut self) {
+        let snap = self.snapshot();
+        if let Some(last) = self.undo_stack.last() {
+            if last.text == snap.text && last.row == snap.row && last.col == snap.col {
+                return;
+            }
+        }
+        self.undo_stack.push(snap);
+        if self.undo_stack.len() > 256 {
+            let _ = self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+
+    fn undo(&mut self) {
+        let Some(prev) = self.undo_stack.pop() else {
+            return;
+        };
+        self.redo_stack.push(self.snapshot());
+        self.restore_from_snapshot(prev);
+    }
+
+    fn redo(&mut self) {
+        let Some(next) = self.redo_stack.pop() else {
+            return;
+        };
+        self.undo_stack.push(self.snapshot());
+        self.restore_from_snapshot(next);
     }
 
     pub fn save(&mut self) -> io::Result<()> {
@@ -121,7 +178,7 @@ impl Document {
             .unwrap_or_else(|| "[new]".to_string())
     }
 
-    /// `true` = quit application.
+    /// `true` = quit application
     pub fn handle_key(&mut self, key: Key) -> io::Result<bool> {
         match key {
             Key::CtrlQ => {
@@ -134,25 +191,35 @@ impl Document {
             Key::CtrlS => {
                 self.save()?;
             }
+            Key::CtrlC => {
+                self.undo();
+            }
+            Key::CtrlV => {
+                self.redo();
+            }
             Key::Char(ch) => {
+                self.push_undo_snapshot();
                 let (r, c) = self.buffer.insert_char(self.row, self.col, ch);
                 self.row = r;
                 self.col = c;
                 self.dirty = true;
             }
             Key::Enter => {
+                self.push_undo_snapshot();
                 let (r, c) = self.buffer.insert_char(self.row, self.col, '\n');
                 self.row = r;
                 self.col = c;
                 self.dirty = true;
             }
             Key::Tab => {
+                self.push_undo_snapshot();
                 let (r, c) = self.buffer.insert_char(self.row, self.col, '\t');
                 self.row = r;
                 self.col = c;
                 self.dirty = true;
             }
             Key::Backspace => {
+                self.push_undo_snapshot();
                 if let Some((r, c)) = self.buffer.backspace(self.row, self.col) {
                     self.row = r;
                     self.col = c;
@@ -160,6 +227,7 @@ impl Document {
                 }
             }
             Key::Delete => {
+                self.push_undo_snapshot();
                 if let Some((r, c)) = self.buffer.delete_forward(self.row, self.col) {
                     self.row = r;
                     self.col = c;
@@ -206,7 +274,27 @@ impl Document {
                 self.row = (self.row + step).min(self.buffer.line_count().saturating_sub(1));
                 self.col = self.col.min(self.buffer.line_len_chars(self.row));
             }
-            Key::Esc | Key::ShiftTab | Key::CtrlB | Key::CtrlL | Key::CtrlK | Key::CtrlN => {}
+            Key::Esc
+            | Key::ShiftTab
+            | Key::CtrlB
+            | Key::CtrlA
+            | Key::CtrlT
+            | Key::CtrlY
+            | Key::CtrlD
+            | Key::CtrlE
+            | Key::CtrlF
+            | Key::CtrlG
+            | Key::CtrlR
+            | Key::CtrlL
+            | Key::CtrlJ
+            | Key::CtrlK
+            | Key::CtrlN
+            | Key::CtrlO
+            | Key::CtrlU
+            | Key::CtrlW
+            | Key::CtrlP
+            | Key::CtrlX
+            | Key::CtrlZ => {}
         }
         self.force_quit_pending = false;
         Ok(false)

@@ -2,7 +2,7 @@ use std::io;
 
 use crate::terminal::read_timeout;
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Key {
     Char(char),
     Enter,
@@ -19,11 +19,28 @@ pub enum Key {
     PageUp,
     PageDown,
     CtrlS,
+    CtrlA,
+    CtrlT,
+    CtrlY,
+    CtrlD,
+    CtrlE,
+    CtrlC,
+    CtrlV,
+    CtrlF,
+    CtrlG,
+    CtrlR,
     CtrlQ,
     CtrlB,
     CtrlL,
+    CtrlJ,
     CtrlK,
     CtrlN,
+    CtrlO,
+    CtrlU,
+    CtrlW,
+    CtrlP,
+    CtrlX,
+    CtrlZ,
     Esc,
 }
 
@@ -54,6 +71,46 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             return Ok(Some(Key::CtrlS));
         }
 
+        if byte == 1 {
+            return Ok(Some(Key::CtrlA));
+        }
+
+        if byte == 20 {
+            return Ok(Some(Key::CtrlT));
+        }
+
+        if byte == 25 {
+            return Ok(Some(Key::CtrlY));
+        }
+
+        if byte == 4 {
+            return Ok(Some(Key::CtrlD));
+        }
+
+        if byte == 5 {
+            return Ok(Some(Key::CtrlE));
+        }
+
+        if byte == 3 {
+            return Ok(Some(Key::CtrlC));
+        }
+
+        if byte == 22 {
+            return Ok(Some(Key::CtrlV));
+        }
+
+        if byte == 6 {
+            return Ok(Some(Key::CtrlF));
+        }
+
+        if byte == 7 {
+            return Ok(Some(Key::CtrlG));
+        }
+
+        if byte == 18 {
+            return Ok(Some(Key::CtrlR));
+        }
+
         if byte == 17 {
             return Ok(Some(Key::CtrlQ));
         }
@@ -66,12 +123,40 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             return Ok(Some(Key::CtrlL));
         }
 
+        if byte == 10 {
+            return Ok(Some(Key::CtrlJ));
+        }
+
         if byte == 11 {
             return Ok(Some(Key::CtrlK));
         }
 
         if byte == 14 {
             return Ok(Some(Key::CtrlN));
+        }
+
+        if byte == 15 {
+            return Ok(Some(Key::CtrlO));
+        }
+
+        if byte == 21 {
+            return Ok(Some(Key::CtrlU));
+        }
+
+        if byte == 23 {
+            return Ok(Some(Key::CtrlW));
+        }
+
+        if byte == 24 {
+            return Ok(Some(Key::CtrlX));
+        }
+
+        if byte == 26 {
+            return Ok(Some(Key::CtrlZ));
+        }
+
+        if byte == 16 {
+            return Ok(Some(Key::CtrlP));
         }
 
         return Ok(None);

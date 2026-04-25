@@ -23,6 +23,8 @@ pub const TEXTS_RU: Texts = Texts {
     hint_ctrl_s_save: "Ctrl+S сохранить",
     hint_ctrl_l_lang: "Ctrl+L язык",
     hint_ctrl_k_help: "Ctrl+K справка",
+    hint_sidebar_focus_actions: "сайдбар: Enter открыть | M меню | Ctrl+N файл | Del удалить",
+    hint_tabs_focus_actions: "табы: Left/Right выбор | Enter открыть | Del/Ctrl+W закрыть | Ctrl+J/Ctrl+N порядок | Ctrl+X pin",
     language_menu_title: "Язык",
     language_menu_hint: "Вверх/Вниз выбор  Enter применить  Ctrl+L закрыть",
     language_option_en: "Английский",
@@ -36,6 +38,7 @@ pub const TEXTS_RU: Texts = Texts {
     help_k5: "Ctrl+L - раздел выбора языка",
     help_k6: "Ctrl+K - раздел горячих клавиш",
     help_k7: "Стрелки/PageUp/PageDown/Home/End - навигация",
+    help_k8: "Табы: Ctrl+P след., Ctrl+U пред., Ctrl+W закрыть, Ctrl+X pin, Ctrl+J влево, Ctrl+N вправо | Ctrl+J (вне табов) command palette | Навигация: Ctrl+A назад, Ctrl+Z вперед | Редакт: Ctrl+C undo, Ctrl+V redo | Ctrl+D мульти-редакт, Ctrl+E синхронный ввод | Ctrl+T символы | Ctrl+Y строка | Ctrl+O файл | Ctrl+F поиск, Ctrl+G заменить текущий, Ctrl+R replace-all",
     save_or_quit_double: "Сначала Ctrl+S (сохранить) или Ctrl+Q дважды.",
     error_prefix: "Ошибка",
 };

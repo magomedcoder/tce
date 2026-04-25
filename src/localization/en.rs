@@ -23,6 +23,8 @@ pub const TEXTS_EN: Texts = Texts {
     hint_ctrl_s_save: "Ctrl+S save",
     hint_ctrl_l_lang: "Ctrl+L language",
     hint_ctrl_k_help: "Ctrl+K help",
+    hint_sidebar_focus_actions: "sidebar: Enter open | M menu | Ctrl+N new file | Del delete",
+    hint_tabs_focus_actions: "tabs: Left/Right select | Enter open | Del/Ctrl+W close | Ctrl+J/Ctrl+N reorder | Ctrl+X pin",
     language_menu_title: "Language",
     language_menu_hint: "Up/Down choose  Enter apply  Ctrl+L close",
     language_option_en: "English",
@@ -36,6 +38,7 @@ pub const TEXTS_EN: Texts = Texts {
     help_k5: "Ctrl+L - language section",
     help_k6: "Ctrl+K - hotkeys section",
     help_k7: "Arrows/PageUp/PageDown/Home/End - navigation",
+    help_k8: "Tabs: Ctrl+P next, Ctrl+U prev, Ctrl+W close, Ctrl+X pin, Ctrl+J left, Ctrl+N right | Ctrl+J (outside tabs) command palette | Nav: Ctrl+A back, Ctrl+Z forward | Edit: Ctrl+C undo, Ctrl+V redo | Ctrl+D multi-edit, Ctrl+E sync edit | Ctrl+T symbols | Ctrl+Y line | Ctrl+O open | Ctrl+F search, Ctrl+G replace current, Ctrl+R replace-all",
     save_or_quit_double: "Save with Ctrl+S or press Ctrl+Q twice.",
     error_prefix: "Error",
 };

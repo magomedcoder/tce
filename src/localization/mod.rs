@@ -30,6 +30,8 @@ pub struct Texts {
     pub hint_ctrl_s_save: &'static str,
     pub hint_ctrl_l_lang: &'static str,
     pub hint_ctrl_k_help: &'static str,
+    pub hint_sidebar_focus_actions: &'static str,
+    pub hint_tabs_focus_actions: &'static str,
     pub language_menu_title: &'static str,
     pub language_menu_hint: &'static str,
     pub language_option_en: &'static str,
@@ -43,6 +45,7 @@ pub struct Texts {
     pub help_k5: &'static str,
     pub help_k6: &'static str,
     pub help_k7: &'static str,
+    pub help_k8: &'static str,
     pub save_or_quit_double: &'static str,
     pub error_prefix: &'static str,
 }
