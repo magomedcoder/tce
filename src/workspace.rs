@@ -13,6 +13,7 @@ use crate::settings::{self, AppSettings};
 use crate::terminal::{winsize_tty, TermSize};
 use crate::tree::{self as filetree, TreeEntry};
 use crate::buffer::Buffer;
+use crate::languages;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -40,6 +41,7 @@ pub struct Workspace {
     sidebar_menu_sel: usize,
     sidebar_prompt: Option<SidebarPrompt>,
     quick_open: Option<QuickOpenState>,
+    in_file_find: Option<InFileFindState>,
     project_search: Option<ProjectSearchState>,
     symbol_jump: Option<SymbolJumpState>,
     go_to_line: Option<GoToLineState>,
@@ -47,6 +49,7 @@ pub struct Workspace {
     sync_edit: Option<SyncEditState>,
     command_palette: Option<CommandPaletteState>,
     diagnostics: Option<DiagnosticsState>,
+    git_view: Option<GitViewState>,
     nav_back: Vec<NavLocation>,
     nav_forward: Vec<NavLocation>,
     autosave_on_edit: bool,
@@ -125,6 +128,12 @@ struct SidebarPrompt {
 
 #[derive(Clone, Debug, Default)]
 struct QuickOpenState {
+    query: String,
+    sel: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct InFileFindState {
     query: String,
     sel: usize,
 }
@@ -234,6 +243,16 @@ impl Default for DiagnosticsState {
     }
 }
 
+#[derive(Clone, Debug)]
+struct GitViewState {
+    title: String,
+    lines: Vec<String>,
+    /// First visible line index
+    scroll: usize,
+    /// Selected line index in `lines`
+    cursor: usize,
+}
+
 impl Workspace {
     fn doc(&self) -> &Document {
         self.docs
@@ -306,6 +325,7 @@ impl Workspace {
             sidebar_menu_sel: 0,
             sidebar_prompt: None,
             quick_open: None,
+            in_file_find: None,
             project_search: None,
             symbol_jump: None,
             go_to_line: None,
@@ -313,6 +333,7 @@ impl Workspace {
             sync_edit: None,
             command_palette: None,
             diagnostics: None,
+            git_view: None,
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             autosave_on_edit: app_settings.autosave_on_edit,
@@ -528,7 +549,7 @@ impl Workspace {
             let text = doc.editor_line_display(line_idx, editor_text_w);
             let clipped_raw: String = text.chars().take(editor_text_w).collect();
             let clipped_raw = apply_ligatures(&clipped_raw, self.ligatures);
-            let clipped = syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
+            let clipped = languages::syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
             if line_idx == doc.row {
                 editor_line.push_str(self.current_line_bg());
                 editor_line.push_str(&clipped);
@@ -547,7 +568,7 @@ impl Workspace {
                 let text = doc.editor_line_display(line_idx, editor_full_w);
                 let clipped_raw: String = text.chars().take(editor_full_w).collect();
                 let clipped_raw = apply_ligatures(&clipped_raw, self.ligatures);
-                let text = syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
+                let text = languages::syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
                 let mut line = format!(
                     "{}{:>width$}{} \x1b[0m{}",
                     self.gutter_color(),
@@ -631,10 +652,14 @@ impl Workspace {
             self.render_command_palette_overlay(&mut out, cols, rows);
         } else if self.diagnostics.as_ref().is_some_and(|d| d.open) {
             self.render_diagnostics_overlay(&mut out, cols, rows);
+        } else if self.git_view.is_some() {
+            self.render_git_view_overlay(&mut out, cols, rows);
         } else if self.symbol_jump.is_some() {
             self.render_symbol_jump_overlay(&mut out, cols, rows);
         } else if self.project_search.is_some() {
             self.render_project_search_overlay(&mut out, cols, rows);
+        } else if self.in_file_find.is_some() {
+            self.render_in_file_find_overlay(&mut out, cols, rows);
         } else if self.quick_open.is_some() {
             self.render_quick_open_overlay(&mut out, cols, rows);
         }
@@ -660,6 +685,12 @@ impl Workspace {
         if self.focus == Focus::Tabs {
             let col = self.tab_cursor_col(cols);
             return (1, col.max(1));
+        }
+        if let Some(state) = &self.in_file_find {
+            let tx = texts(self.language);
+            let prompt = format!("{} {}", tx.find_in_file_prompt, state.query);
+            let col = prompt.chars().count().saturating_add(1) as u32;
+            return (rows_to_u32(content_h + 2), col.max(1));
         }
         if let Some(state) = &self.quick_open {
             let prompt = format!("Quick open: {}", state.query);
@@ -697,6 +728,9 @@ impl Workspace {
             return (rows_to_u32(content_h + 2), col.max(1));
         }
         if self.diagnostics.as_ref().is_some_and(|d| d.open) {
+            return (rows_to_u32(content_h + 2), 1);
+        }
+        if self.git_view.is_some() {
             return (rows_to_u32(content_h + 2), 1);
         }
         if let Some(state) = &self.multi_edit {
@@ -831,6 +865,10 @@ impl Workspace {
             self.handle_quick_open_key(key);
             return Ok(false);
         }
+        if self.in_file_find.is_some() {
+            self.handle_in_file_find_key(key);
+            return Ok(false);
+        }
         if self.project_search.is_some() {
             self.handle_project_search_key(key);
             return Ok(false);
@@ -857,6 +895,10 @@ impl Workspace {
         }
         if self.diagnostics.as_ref().is_some_and(|d| d.open) {
             self.handle_diagnostics_key(key);
+            return Ok(false);
+        }
+        if self.git_view.is_some() {
+            self.handle_git_view_key(key);
             return Ok(false);
         }
 
@@ -922,6 +964,19 @@ impl Workspace {
             self.project_search = Some(ProjectSearchState::default());
             return Ok(false);
         }
+        if matches!(key, Key::CtrlBackslash) {
+            let w = self.word_under_cursor();
+            let seed = if w.chars().count() > 80 {
+                String::new()
+            } else {
+                w
+            };
+            self.in_file_find = Some(InFileFindState {
+                query: seed,
+                sel: 0,
+            });
+            return Ok(false);
+        }
         if matches!(key, Key::CtrlT) {
             self.symbol_jump = Some(SymbolJumpState::default());
             return Ok(false);
@@ -949,6 +1004,17 @@ impl Workspace {
         if matches!(key, Key::CtrlJ) && self.focus != Focus::Tabs {
             self.command_palette = Some(CommandPaletteState::default());
             return Ok(false);
+        }
+
+        if self.focus == Focus::Editor && self.docs.len() >= 2 {
+            if matches!(key, Key::CtrlArrowLeft) {
+                self.move_tab_left(self.active_doc);
+                return Ok(false);
+            }
+            if matches!(key, Key::CtrlArrowRight) {
+                self.move_tab_right(self.active_doc);
+                return Ok(false);
+            }
         }
 
         if matches!(key, Key::ShiftTab) {
@@ -1791,6 +1857,122 @@ impl Workspace {
         }
     }
 
+    fn handle_in_file_find_key(&mut self, key: Key) {
+        if self.in_file_find.is_none() {
+            return;
+        }
+        match key {
+            Key::Esc | Key::CtrlBackslash => {
+                self.in_file_find = None;
+                return;
+            }
+            Key::Backspace => {
+                if let Some(st) = self.in_file_find.as_mut() {
+                    st.query.pop();
+                    st.sel = 0;
+                }
+                return;
+            }
+            Key::Char(ch) => {
+                if let Some(st) = self.in_file_find.as_mut() {
+                    st.query.push(ch);
+                    st.sel = 0;
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        let matches = self.in_file_find_matches();
+        match key {
+            Key::Tab | Key::ArrowDown => {
+                if let Some(st) = self.in_file_find.as_mut() {
+                    if matches.is_empty() {
+                        return;
+                    }
+                    st.sel = (st.sel + 1) % matches.len();
+                }
+            }
+            Key::ShiftTab | Key::ArrowUp => {
+                if let Some(st) = self.in_file_find.as_mut() {
+                    if matches.is_empty() {
+                        return;
+                    }
+                    st.sel = st.sel.checked_sub(1).unwrap_or(matches.len().saturating_sub(1));
+                }
+            }
+            Key::Home => {
+                if let Some(st) = self.in_file_find.as_mut() {
+                    st.sel = 0;
+                }
+            }
+            Key::End => {
+                if let Some(st) = self.in_file_find.as_mut() {
+                    st.sel = matches.len().saturating_sub(1);
+                }
+            }
+            Key::Enter => {
+                if matches.is_empty() {
+                    if self
+                        .in_file_find
+                        .as_ref()
+                        .is_some_and(|s| s.query.is_empty())
+                    {
+                        self.in_file_find = None;
+                    } else {
+                        self.tip = Some(texts(self.language).tip_no_in_file_matches.to_string());
+                    }
+                    return;
+                }
+                let idx = self
+                    .in_file_find
+                    .as_ref()
+                    .map(|s| s.sel)
+                    .unwrap_or(0)
+                    .min(matches.len().saturating_sub(1));
+                let (row, col) = matches[idx];
+                self.in_file_find = None;
+                self.jump_in_active_doc(row, col, true);
+            }
+            _ => {}
+        }
+    }
+
+    fn in_file_find_matches(&self) -> Vec<(usize, usize)> {
+        let Some(state) = self.in_file_find.as_ref() else {
+            return Vec::new();
+        };
+        Self::buffer_match_positions(self.doc(), &state.query)
+    }
+
+    fn buffer_match_positions(doc: &Document, query: &str) -> Vec<(usize, usize)> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let needle: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+        let n = needle.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (ri, line) in doc.buffer.lines().iter().enumerate() {
+            let line_l: Vec<char> = line.chars().flat_map(|c| c.to_lowercase()).collect();
+            if line_l.len() < n {
+                continue;
+            }
+            let last = line_l.len() - n;
+            for i in 0..=last {
+                if line_l[i..i + n] == needle[..] {
+                    out.push((ri, i));
+                    if out.len() >= 2000 {
+                        return out;
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn quick_open_matches(&self) -> Vec<PathBuf> {
         let mut files: Vec<PathBuf> = self
             .tree
@@ -2402,6 +2584,12 @@ impl Workspace {
             ("Toggle Pin Tab", "toggle_pin"),
             ("Show Hotkeys", "show_help"),
             ("Language Picker", "language_picker"),
+            ("LSP First-Wave Extensions", "lsp_wave_extensions"),
+            ("Find in File", "in_file_find"),
+            ("Git: Status", "git_status"),
+            ("Git: Diff (unstaged)", "git_diff_unstaged"),
+            ("Git: Diff (staged)", "git_diff_staged"),
+            ("Git: Recent commits", "git_log"),
         ];
         if let Some(state) = &self.command_palette {
             let q = state.query.to_lowercase();
@@ -2540,6 +2728,37 @@ impl Workspace {
                 self.language_picker = true;
                 self.language_sel = if self.language == Language::En { 0 } else { 1 };
             }
+            "lsp_wave_extensions" => {
+                let cur = self
+                    .doc()
+                    .path
+                    .as_deref()
+                    .is_some_and(languages::is_first_wave_path);
+                self.tip = Some(format!(
+                    "LSP v1: {} | current: {}",
+                    languages::FIRST_WAVE_EXTENSIONS.join(", "),
+                    if cur { "yes" } else { "no" }
+                ));
+            }
+            "in_file_find" => {
+                let w = self.word_under_cursor();
+                let seed = if w.chars().count() > 80 {
+                    String::new()
+                } else {
+                    w
+                };
+                self.in_file_find = Some(InFileFindState {
+                    query: seed,
+                    sel: 0,
+                });
+            }
+            "git_status" => self.open_git_output("Git: status", &["status", "-sb"]),
+            "git_diff_unstaged" => self.open_git_output("Git: diff (unstaged)", &["diff", "--stat"]),
+            "git_diff_staged" => self.open_git_output("Git: diff (staged)", &["diff", "--cached", "--stat"]),
+            "git_log" => self.open_git_output(
+                "Git: log",
+                &["log", "-n", "24", "--oneline", "--decorate"],
+            ),
             _ => {}
         }
         self.persist_settings();
@@ -2688,6 +2907,109 @@ impl Workspace {
         }
     }
 
+    fn open_git_output(&mut self, title: &str, args: &[&str]) {
+        let out = match Command::new("git")
+            .current_dir(&self.project_root)
+            .args(args)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                self.tip = Some(format!("{}: {e}", texts(self.language).error_prefix));
+                return;
+            }
+        };
+        let mut combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if combined.is_empty() {
+            combined.push_str("(empty output)");
+        }
+        let lines: Vec<String> = combined.lines().map(|s| s.to_string()).collect();
+        let title = if out.status.success() {
+            title.to_string()
+        } else {
+            format!("{} (git exit {})", title, out.status)
+        };
+        self.git_view = Some(GitViewState {
+            title,
+            lines,
+            scroll: 0,
+            cursor: 0,
+        });
+    }
+
+    fn handle_git_view_key(&mut self, key: Key) {
+        let Some(state) = self.git_view.as_mut() else {
+            return;
+        };
+        let total = state.lines.len();
+        let size = winsize_tty().unwrap_or(TermSize { rows: 24, cols: 80 });
+        let rows = size.rows.max(1) as usize;
+        let body_h = rows.saturating_sub(2).max(1);
+
+        match key {
+            Key::Esc => {
+                self.git_view = None;
+            }
+            Key::ArrowUp => {
+                state.cursor = state.cursor.saturating_sub(1);
+                if state.cursor < state.scroll {
+                    state.scroll = state.cursor;
+                }
+            }
+            Key::ArrowDown => {
+                if total > 0 {
+                    state.cursor = (state.cursor + 1).min(total - 1);
+                    let max_scroll = total.saturating_sub(body_h);
+                    if state.cursor >= state.scroll + body_h {
+                        state.scroll = state.cursor + 1 - body_h;
+                    }
+                    if state.scroll > max_scroll {
+                        state.scroll = max_scroll;
+                    }
+                }
+            }
+            Key::PageUp => {
+                let step = body_h.max(1);
+                state.cursor = state.cursor.saturating_sub(step);
+                state.scroll = state.scroll.saturating_sub(step);
+            }
+            Key::PageDown => {
+                let step = body_h.max(1);
+                if total > 0 {
+                    state.cursor = (state.cursor + step).min(total - 1);
+                    let max_scroll = total.saturating_sub(body_h);
+                    state.scroll = (state.scroll + step).min(max_scroll);
+                    if state.cursor < state.scroll {
+                        state.scroll = state.cursor;
+                    }
+                }
+            }
+            Key::Home => {
+                state.cursor = 0;
+                state.scroll = 0;
+            }
+            Key::End => {
+                if total > 0 {
+                    state.cursor = total - 1;
+                }
+                state.scroll = total.saturating_sub(body_h);
+            }
+            Key::Enter => {
+                let line = state.lines.get(state.cursor).cloned().unwrap_or_default();
+                let root = self.project_root.clone();
+                if let Some(path) = path_from_git_short_status_line(&root, &line) {
+                    self.git_view = None;
+                    self.jump_to_path_position(path, 0, 0, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn symbol_jump_matches(&self) -> Vec<SymbolItem> {
         let Some(state) = &self.symbol_jump else {
             return Vec::new();
@@ -2825,6 +3147,58 @@ impl Workspace {
                 out.push_str(&format!("\x1b[{};1H{}", row, line));
             }
             row = row.saturating_sub(1);
+        }
+    }
+
+    fn render_in_file_find_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.in_file_find.as_ref() else {
+            return;
+        };
+
+        let tx = texts(self.language);
+        if rows < 2 || cols == 0 {
+            return;
+        }
+
+        let matches = self.in_file_find_matches();
+        let meta = if matches.is_empty() {
+            if state.query.is_empty() {
+                String::new()
+            } else {
+                " - 0".to_string()
+            }
+        } else {
+            format!(
+                " - {}/{}",
+                (state.sel + 1).min(matches.len()),
+                matches.len()
+            )
+        };
+
+        let prompt_row = rows;
+        let mut prompt = format!("{} {}{}", tx.find_in_file_prompt, state.query, meta);
+        if prompt.chars().count() > cols {
+            prompt = prompt
+                .chars()
+                .skip(prompt.chars().count().saturating_sub(cols))
+                .collect();
+        }
+
+        out.push_str(&format!("\x1b[{};1H\x1b[7m", prompt_row));
+        out.push_str(&prompt);
+        while prompt.chars().count() < cols {
+            out.push(' ');
+            prompt.push(' ');
+        }
+        out.push_str("\x1b[0m");
+
+        if rows >= 3 {
+            let hint = truncate_str(tx.find_in_file_hint, cols);
+            out.push_str(&format!(
+                "\x1b[{};1H\x1b[90m{}\x1b[0m",
+                rows.saturating_sub(1),
+                hint
+            ));
         }
     }
 
@@ -3140,6 +3514,64 @@ impl Workspace {
         }
     }
 
+    fn render_git_view_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.git_view.as_ref() else {
+            return;
+        };
+
+        if rows < 3 || cols == 0 {
+            return;
+        }
+
+        let hint = "Esc close | arrows PgUp/Dn | Home/End | Enter=open file (from status)";
+        let hint = truncate_str(hint, cols);
+        out.push_str(&format!("\x1b[1;1H\x1b[90m{hint}\x1b[0m"));
+
+        let body_h = rows.saturating_sub(2).max(1);
+        let last_line = (state.scroll + body_h).min(state.lines.len().max(1));
+        let mut title_line = format!(
+            "{}  (lines {}-{} of {})",
+            state.title,
+            state.scroll + 1,
+            last_line,
+            state.lines.len()
+        );
+
+        if title_line.chars().count() > cols {
+            title_line = truncate_str(&title_line, cols);
+        }
+
+        while title_line.chars().count() < cols {
+            title_line.push(' ');
+        }
+
+        out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
+        out.push_str(&title_line);
+        out.push_str("\x1b[0m");
+
+        let mut row = rows.saturating_sub(1);
+        let start = state.scroll;
+        let end = (start + body_h).min(state.lines.len());
+        for line_idx in start..end {
+            if row <= 1 {
+                break;
+            }
+
+            let line = state.lines.get(line_idx).cloned().unwrap_or_default();
+            let mut clipped = truncate_str(&line, cols);
+            while clipped.chars().count() < cols {
+                clipped.push(' ');
+            }
+
+            if line_idx == state.cursor {
+                out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, clipped));
+            } else {
+                out.push_str(&format!("\x1b[{};1H{}", row, clipped));
+            }
+            row = row.saturating_sub(1);
+        }
+    }
+
     fn render_search_replace_preview(&self, hit: &SearchMatch) -> Option<String> {
         let state = self.project_search.as_ref()?;
         if state.query.is_empty() || state.replacement.is_empty() {
@@ -3327,6 +3759,8 @@ impl Workspace {
             tx.help_k6.to_string(),
             tx.help_k7.to_string(),
             tx.help_k8.to_string(),
+            tx.help_k9.to_string(),
+            tx.help_k10.to_string(),
             String::new(),
             tx.help_hint.to_string(),
         ];
@@ -3356,6 +3790,37 @@ impl Workspace {
 
 fn rows_to_u32(row: usize) -> u32 {
     row.min(u32::MAX as usize) as u32
+}
+
+/// `git status -sb` lines: `XY PATH` (two status chars, space, path)
+fn path_from_git_short_status_line(project_root: &Path, line: &str) -> Option<PathBuf> {
+    let t = line.trim_end();
+    if t.starts_with("## ") || t.len() < 4 {
+        return None;
+    }
+
+    let bytes = t.as_bytes();
+    if bytes.get(2) != Some(&b' ') {
+        return None;
+    }
+
+    let rest = t.get(3..)?.trim();
+    if rest.is_empty() || rest.contains(" -> ") {
+        return None;
+    }
+
+    let p = PathBuf::from(rest);
+    let full = if p.is_absolute() {
+        p
+    } else {
+        project_root.join(p)
+    };
+    
+    if full.is_file() {
+        Some(full)
+    } else {
+        None
+    }
 }
 
 fn extract_symbol_from_line(line: &str) -> Option<(String, String)> {
@@ -3406,79 +3871,6 @@ fn whole_word_regex(word: &str) -> Option<Regex> {
 
     let pat = format!(r"\b{}\b", regex::escape(word));
     Regex::new(&pat).ok()
-}
-
-fn syntax_highlight_line(path: Option<&PathBuf>, line: &str) -> String {
-    let ext = path
-        .and_then(|p| p.extension())
-        .and_then(|e| e.to_str())
-        .unwrap_or_default();
-    if ext != "rs" {
-        return line.to_string();
-    }
-
-    let mut out = String::new();
-    let mut chars = line.chars().peekable();
-    let rust_keywords = [
-        "fn", "let", "mut", "pub", "impl", "struct", "enum", "trait", "use", "mod", "if",
-        "else", "match", "for", "while", "loop", "return", "crate", "self", "Self",
-    ];
-
-    while let Some(ch) = chars.next() {
-        if ch == '/' && chars.peek() == Some(&'/') {
-            out.push_str("\x1b[32m//");
-            let _ = chars.next();
-            for c in chars {
-                out.push(c);
-            }
-            
-            out.push_str("\x1b[0m");
-            break;
-        }
-
-        if ch == '"' {
-            out.push_str("\x1b[33m\"");
-            while let Some(c) = chars.next() {
-                out.push(c);
-                if c == '"' {
-                    break;
-                }
-
-                if c == '\\' {
-                    if let Some(n) = chars.next() {
-                        out.push(n);
-                    }
-                }
-            }
-
-            out.push_str("\x1b[0m");
-            continue;
-        }
-
-        if ch.is_alphabetic() || ch == '_' {
-            let mut ident = String::from(ch);
-            while let Some(next) = chars.peek().copied() {
-                if next.is_alphanumeric() || next == '_' {
-                    ident.push(next);
-                    let _ = chars.next();
-                } else {
-                    break;
-                }
-            }
-
-            if rust_keywords.iter().any(|k| *k == ident) {
-                out.push_str("\x1b[36m");
-                out.push_str(&ident);
-                out.push_str("\x1b[0m");
-            } else {
-                out.push_str(&ident);
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-
-    out
 }
 
 fn apply_ligatures(line: &str, enabled: bool) -> String {

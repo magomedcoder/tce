@@ -294,7 +294,12 @@ impl Document {
             | Key::CtrlW
             | Key::CtrlP
             | Key::CtrlX
-            | Key::CtrlZ => {}
+            | Key::CtrlZ
+            | Key::CtrlArrowLeft
+            | Key::CtrlArrowRight
+            | Key::CtrlArrowUp
+            | Key::CtrlArrowDown
+            | Key::CtrlBackslash => {}
         }
         self.force_quit_pending = false;
         Ok(false)

@@ -41,6 +41,13 @@ pub enum Key {
     CtrlP,
     CtrlX,
     CtrlZ,
+    /// Ctrl+\ (0x1c) - find in current buffer (project search stays on Ctrl+F)
+    CtrlBackslash,
+    /// CSI `1;5D` / SS3 style - terminal sends for Ctrl+Left (xterm)
+    CtrlArrowLeft,
+    CtrlArrowRight,
+    CtrlArrowUp,
+    CtrlArrowDown,
     Esc,
 }
 
@@ -155,6 +162,10 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             return Ok(Some(Key::CtrlZ));
         }
 
+        if byte == 28 {
+            return Ok(Some(Key::CtrlBackslash));
+        }
+
         if byte == 16 {
             return Ok(Some(Key::CtrlP));
         }
@@ -243,6 +254,16 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         return Ok(Some(Key::Esc));
     }
 
+    if seq[0] == b'O' && seq.len() >= 3 && seq[1] == b'5' {
+        return Ok(Some(match seq[2] {
+            b'D' => Key::CtrlArrowLeft,
+            b'C' => Key::CtrlArrowRight,
+            b'A' => Key::CtrlArrowUp,
+            b'B' => Key::CtrlArrowDown,
+            _ => return Ok(None),
+        }));
+    }
+
     if seq[0] == b'O' && seq.len() >= 2 {
         return Ok(Some(match seq[1] {
             b'A' => Key::ArrowUp,
@@ -271,7 +292,11 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     if body[0] == b'Z' {
         return Ok(Some(Key::ShiftTab));
     }
-    
+
+    if let Some(k) = parse_csi_modified_arrow(body) {
+        return Ok(Some(k));
+    }
+
     match body[0] {
         b'A' => return Ok(Some(Key::ArrowUp)),
         b'B' => return Ok(Some(Key::ArrowDown)),
@@ -282,16 +307,18 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         _ => {}
     }
 
-    // Handle CSI sequences like ESC [ 1 ; 5 A
-    if let Some(last) = body.last().copied() {
-        match last {
-            b'A' => return Ok(Some(Key::ArrowUp)),
-            b'B' => return Ok(Some(Key::ArrowDown)),
-            b'C' => return Ok(Some(Key::ArrowRight)),
-            b'D' => return Ok(Some(Key::ArrowLeft)),
-            b'H' => return Ok(Some(Key::Home)),
-            b'F' => return Ok(Some(Key::End)),
-            _ => {}
+    // Plain CSI arrows (no `;` params), e.g. ESC [ A - not ESC [ 1 ; 5 D
+    if !body.contains(&b';') {
+        if let Some(last) = body.last().copied() {
+            match last {
+                b'A' => return Ok(Some(Key::ArrowUp)),
+                b'B' => return Ok(Some(Key::ArrowDown)),
+                b'C' => return Ok(Some(Key::ArrowRight)),
+                b'D' => return Ok(Some(Key::ArrowLeft)),
+                b'H' => return Ok(Some(Key::Home)),
+                b'F' => return Ok(Some(Key::End)),
+                _ => {}
+            }
         }
     }
 
@@ -308,4 +335,36 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         }
     }
     Ok(None)
+}
+
+/// `ESC [ 1 ; 5 D` style (xterm): last numeric parameter before final byte is the modifier (`5` = Ctrl)
+fn parse_csi_modified_arrow(body: &[u8]) -> Option<Key> {
+    if body.len() < 3 {
+        return None;
+    }
+    
+    let dir = *body.last()?;
+    if !matches!(dir, b'A' | b'B' | b'C' | b'D') {
+        return None;
+    }
+
+    let prefix = &body[..body.len() - 1];
+    if !prefix.contains(&b';') {
+        return None;
+    }
+
+    let modifier = parse_csi_final_modifier(prefix)?;
+    match (modifier, dir) {
+        (5, b'D') => Some(Key::CtrlArrowLeft),
+        (5, b'C') => Some(Key::CtrlArrowRight),
+        (5, b'A') => Some(Key::CtrlArrowUp),
+        (5, b'B') => Some(Key::CtrlArrowDown),
+        _ => None,
+    }
+}
+
+fn parse_csi_final_modifier(prefix: &[u8]) -> Option<u32> {
+    let s = std::str::from_utf8(prefix).ok()?;
+    let last_seg = s.split(';').last()?;
+    last_seg.parse().ok()
 }

@@ -46,8 +46,13 @@ pub struct Texts {
     pub help_k6: &'static str,
     pub help_k7: &'static str,
     pub help_k8: &'static str,
+    pub find_in_file_prompt: &'static str,
+    pub find_in_file_hint: &'static str,
+    pub help_k9: &'static str,
+    pub help_k10: &'static str,
     pub save_or_quit_double: &'static str,
     pub error_prefix: &'static str,
+    pub tip_no_in_file_matches: &'static str,
 }
 
 pub fn texts(lang: Language) -> &'static Texts {
