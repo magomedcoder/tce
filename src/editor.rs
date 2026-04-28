@@ -34,7 +34,7 @@ pub struct Editor {
     pub hscroll: usize,
     pub path: Option<PathBuf>,
     pub dirty: bool,
-    /// After `Ctrl+Q` on a dirty buffer, set until another key or second `Ctrl+Q`
+    /// После `Ctrl+Q` на грязном буфере флаг выставляется до другой клавиши или повторного `Ctrl+Q`
     force_quit_pending: bool,
 }
 
@@ -190,7 +190,7 @@ impl Editor {
         Ok(())
     }
 
-    /// Returns `true` if should exit.
+    /// Возвращает `true`, если нужно завершить приложение
     fn handle_key(&mut self, key: Key) -> io::Result<bool> {
         match key {
             Key::CtrlQ => {
@@ -346,7 +346,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         return Ok(Some(Key::Esc));
     }
 
-    // SS3: ESC O A (arrow keys on some terminals)
+    // SS3: ESC O A (стрелки в некоторых терминалах)
     if seq[0] == b'O' && seq.len() >= 2 {
         return Ok(Some(match seq[1] {
             b'A' => Key::ArrowUp,

@@ -1,4 +1,4 @@
-//! Recent project roots (directories), one path per line in ~/.config/.tce/recents.txt
+//! Недавние проекты, по одному пути в строке файла ~/.config/.tce/recents.txt
 
 use std::fs;
 use std::io;
@@ -71,11 +71,13 @@ pub fn push_front(root: PathBuf) -> io::Result<()> {
         .filter_map(|p| p.to_str())
         .collect::<Vec<_>>()
         .join("\n");
+
     if body.is_empty() {
         fs::write(&path, "")?;
     } else {
         fs::write(&path, format!("{body}\n"))?;
     }
+    
     Ok(())
 }
 

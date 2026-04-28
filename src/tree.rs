@@ -1,4 +1,4 @@
-//! Flat file tree under a project root (depth-first, dirs first)
+//! Плоское представление дерева файлов в корне проекта (обход в глубину, сначала каталоги)
 
 use std::ffi::OsStr;
 use std::fs;

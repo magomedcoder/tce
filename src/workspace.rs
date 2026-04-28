@@ -2,15 +2,27 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use regex::Regex;
 
+use crate::agent_orchestrator::AgentOrchestrator;
+use crate::agent_sandbox::AgentSandbox;
+use crate::agent_tools::AgentToolExecutor;
 use crate::document::Document;
 use crate::keys::Key;
 use crate::localization::{texts, Language};
 use crate::recents;
 use crate::session;
-use crate::settings::{self, AppSettings};
+use crate::settings;
 use crate::terminal::{winsize_tty, TermSize};
+use crate::llm_api::{
+    ChatMessage as LlmChatMessage, 
+    ChatRequest as LlmChatRequest, 
+    EditorContext as LlmEditorContext,
+    GenerateParams as LlmGenerateParams, 
+    TceLlmClient,
+};
 use crate::tree::{self as filetree, TreeEntry};
 use crate::buffer::Buffer;
 use crate::languages;
@@ -20,6 +32,7 @@ pub enum Focus {
     Editor,
     Sidebar,
     Tabs,
+    RightPanel,
 }
 
 pub struct Workspace {
@@ -31,6 +44,8 @@ pub struct Workspace {
     active_doc: usize,
     tab_sel: usize,
     sidebar_visible: bool,
+    right_panel_visible: bool,
+    right_panel_input: String,
     focus: Focus,
     tip: Option<String>,
     language: Language,
@@ -45,6 +60,10 @@ pub struct Workspace {
     project_search: Option<ProjectSearchState>,
     symbol_jump: Option<SymbolJumpState>,
     go_to_line: Option<GoToLineState>,
+    llm_prompt: Option<LlmPromptState>,
+    llm_history_view: Option<LlmHistoryViewState>,
+    agent_events_view: Option<AgentEventsViewState>,
+    agent_unsafe_confirm: bool,
     multi_edit: Option<MultiEditState>,
     sync_edit: Option<SyncEditState>,
     command_palette: Option<CommandPaletteState>,
@@ -59,6 +78,13 @@ pub struct Workspace {
     font_zoom: i8,
     line_spacing: bool,
     ligatures: bool,
+    llm_health_checked: bool,
+    llm_history: Vec<LlmHistoryEntry>,
+    agent_events: Vec<String>,
+    llm_status: String,
+    llm_inflight: Option<LlmInFlight>,
+    agent_inflight: Option<AgentInFlight>,
+    agent_allow_unsafe_tools: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +202,54 @@ struct GoToLineState {
 }
 
 #[derive(Clone, Debug, Default)]
+struct LlmPromptState {
+    input: String,
+}
+
+#[derive(Clone, Debug)]
+struct LlmHistoryEntry {
+    role: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LlmHistoryViewState {
+    scroll: usize,
+    cursor: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AgentEventsViewState {
+    scroll: usize,
+    cursor: usize,
+}
+
+struct LlmInFlight {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<LlmTaskResult>,
+}
+
+enum LlmTaskResult {
+    Delta(String),
+    Ok(String),
+    Err(String),
+}
+
+struct AgentInFlight {
+    rx: mpsc::Receiver<AgentTaskResult>,
+}
+
+enum AgentTaskResult {
+    Ok {
+        summary: String,
+        steps: usize,
+        finished: bool,
+        events: Vec<String>,
+    },
+    Err(String),
+}
+
+#[derive(Clone, Debug, Default)]
 struct MultiEditState {
     target: String,
     replacement: String,
@@ -247,18 +321,15 @@ impl Default for DiagnosticsState {
 struct GitViewState {
     title: String,
     lines: Vec<String>,
-    /// First visible line index
+    /// Индекс первой видимой строки
     scroll: usize,
-    /// Selected line index in `lines`
+    /// Индекс выбранной строки в `lines`
     cursor: usize,
 }
 
 impl Workspace {
     fn doc(&self) -> &Document {
-        self.docs
-            .get(self.active_doc)
-            .or_else(|| self.docs.first())
-            .expect("workspace always keeps at least one document")
+        self.docs.get(self.active_doc).or_else(|| self.docs.first()).expect("workspace always keeps at least one document")
     }
 
     fn doc_mut(&mut self) -> &mut Document {
@@ -268,6 +339,7 @@ impl Workspace {
         } else if self.active_doc >= self.docs.len() {
             self.active_doc = self.docs.len().saturating_sub(1);
         }
+
         &mut self.docs[self.active_doc]
     }
 
@@ -286,15 +358,16 @@ impl Workspace {
                 doc.pinned = persisted.pinned.iter().any(|p| p == path);
             }
         }
+
         if docs.is_empty() {
             docs.push(Document::empty());
         }
+
         let active_doc = persisted
             .active
             .as_ref()
             .and_then(|active| {
-                docs.iter()
-                    .position(|d| d.path.as_ref().is_some_and(|p| p == active))
+                docs.iter().position(|d| d.path.as_ref().is_some_and(|p| p == active))
             })
             .unwrap_or(0)
             .min(docs.len().saturating_sub(1));
@@ -306,6 +379,7 @@ impl Workspace {
             .or_else(|| tree.iter().position(|e| !e.is_dir))
             .unwrap_or(0)
             .min(tree.len().saturating_sub(1));
+
         Ok(Self {
             project_root: root,
             tree,
@@ -315,6 +389,8 @@ impl Workspace {
             active_doc,
             tab_sel,
             sidebar_visible: true,
+            right_panel_visible: app_settings.llm_enabled && app_settings.right_panel_visible,
+            right_panel_input: String::new(),
             focus: Focus::Editor,
             tip: None,
             language: app_settings.language,
@@ -329,6 +405,10 @@ impl Workspace {
             project_search: None,
             symbol_jump: None,
             go_to_line: None,
+            llm_prompt: None,
+            llm_history_view: None,
+            agent_events_view: None,
+            agent_unsafe_confirm: false,
             multi_edit: None,
             sync_edit: None,
             command_palette: None,
@@ -343,6 +423,13 @@ impl Workspace {
             font_zoom: app_settings.font_zoom,
             line_spacing: app_settings.line_spacing,
             ligatures: app_settings.ligatures,
+            llm_health_checked: false,
+            llm_history: Vec::new(),
+            agent_events: Vec::new(),
+            llm_status: "idle".to_string(),
+            llm_inflight: None,
+            agent_inflight: None,
+            agent_allow_unsafe_tools: false,
         })
     }
 
@@ -385,11 +472,7 @@ impl Workspace {
         ws.docs = vec![Document::open_file(file)?];
         ws.active_doc = 0;
         ws.tab_sel = 0;
-        ws.tree_sel = ws
-            .tree
-            .iter()
-            .position(|e| e.path == file_canon)
-            .unwrap_or(ws.tree_sel);
+        ws.tree_sel = ws.tree.iter().position(|e| e.path == file_canon).unwrap_or(ws.tree_sel);
         ws.focus = Focus::Editor;
         Ok(ws)
     }
@@ -405,17 +488,19 @@ impl Workspace {
     }
 
     fn persist_settings(&self) {
-        let s = AppSettings {
-            dark_theme: self.dark_theme,
-            autosave_on_edit: self.autosave_on_edit,
-            font_zoom: self.font_zoom,
-            line_spacing: self.line_spacing,
-            ligatures: self.ligatures,
-            language: self.language,
-        };
+        let mut s = settings::load_settings();
+        s.dark_theme = self.dark_theme;
+        s.autosave_on_edit = self.autosave_on_edit;
+        s.font_zoom = self.font_zoom;
+        s.line_spacing = self.line_spacing;
+        s.ligatures = self.ligatures;
+        s.language = self.language;
         let _ = settings::save_settings(&s);
     }
 
+    fn llm_enabled_in_settings() -> bool {
+        settings::load_settings().llm_enabled
+    }
     fn sidebar_width_cols(term_cols: usize) -> usize {
         if term_cols < 48 {
             return term_cols.min(20).max(12);
@@ -423,12 +508,25 @@ impl Workspace {
         (term_cols / 4).clamp(18, 36)
     }
 
-    fn editor_width(term_cols: usize, sidebar_visible: bool) -> usize {
-        if !sidebar_visible {
-            return term_cols.max(1);
+    fn right_panel_width_cols(term_cols: usize) -> usize {
+        if term_cols < 64 {
+            return 22;
         }
-        let sw = Self::sidebar_width_cols(term_cols);
-        term_cols.saturating_sub(sw + 1).max(12)
+        (term_cols / 4).clamp(22, 34)
+    }
+
+    fn editor_width(term_cols: usize, sidebar_visible: bool, right_panel_visible: bool) -> usize {
+        let sidebar_w = if sidebar_visible {
+            Self::sidebar_width_cols(term_cols) + 1
+        } else {
+            0
+        };
+        let right_w = if right_panel_visible {
+            Self::right_panel_width_cols(term_cols) + 1
+        } else {
+            0
+        };
+        term_cols.saturating_sub(sidebar_w + right_w).max(12)
     }
 
     fn editor_gutter_width(&self) -> usize {
@@ -454,38 +552,29 @@ impl Workspace {
         let state = self.diagnostics.as_ref()?;
         let path = self.doc().path.as_ref()?;
         let row = self.doc().row;
-        state
-            .items
-            .iter()
-            .find(|d| &d.path == path && d.row == row)
-            .map(|d| {
-                let sev = match d.severity {
-                    DiagnosticSeverity::Error => "E",
-                    DiagnosticSeverity::Warning => "W",
-                };
-                format!("[{sev}] {}", d.message)
-            })
+        state.items.iter().find(|d| &d.path == path && d.row == row).map(|d| {
+            let sev = match d.severity {
+                DiagnosticSeverity::Error => "E",
+                DiagnosticSeverity::Warning => "W",
+            };
+            format!("[{sev}] {}", d.message)
+        })
     }
 
     fn line_diagnostic_marker(&self, line_idx: usize) -> Option<char> {
         let Some(state) = self.diagnostics.as_ref() else {
             return None;
         };
+
         let Some(path) = self.doc().path.as_ref() else {
             return None;
         };
-        if state
-            .items
-            .iter()
-            .any(|d| &d.path == path && d.row == line_idx && d.severity == DiagnosticSeverity::Error)
-        {
+
+        if state.items.iter().any(|d| &d.path == path && d.row == line_idx && d.severity == DiagnosticSeverity::Error) {
             return Some('E');
         }
-        if state
-            .items
-            .iter()
-            .any(|d| &d.path == path && d.row == line_idx && d.severity == DiagnosticSeverity::Warning)
-        {
+
+        if state.items.iter().any(|d| &d.path == path && d.row == line_idx && d.severity == DiagnosticSeverity::Warning) {
             return Some('W');
         }
         None
@@ -495,9 +584,11 @@ impl Workspace {
         if self.hotkeys_help {
             return self.render_hotkeys_help();
         }
+
         if self.language_picker {
             return self.render_language_picker();
         }
+
         self.doc_mut().clamp_cursor();
         let size = winsize_tty().unwrap_or(TermSize { rows: 24, cols: 80 });
         let rows = size.rows.max(1) as usize;
@@ -507,7 +598,11 @@ impl Workspace {
         let line_stride = if self.line_spacing { 2 } else { 1 };
         let logical_content_h = (content_h / line_stride).max(1);
         let sidebar_w = Self::sidebar_width_cols(cols);
-        let editor_w = Self::editor_width(cols, self.sidebar_visible);
+        let sidebar_on = self.sidebar_visible && cols > sidebar_w + 4;
+        let right_panel_w = Self::right_panel_width_cols(cols);
+        let llm_enabled = Self::llm_enabled_in_settings();
+        let right_panel_on = llm_enabled && self.right_panel_visible && cols > right_panel_w + 8;
+        let editor_w = Self::editor_width(cols, sidebar_on, right_panel_on);
         let gutter_w = self.editor_gutter_width();
 
         self.doc_mut().adjust_scroll(logical_content_h, editor_w.max(1));
@@ -521,20 +616,19 @@ impl Workspace {
 
         for row in 0..content_h {
             if self.line_spacing && row % 2 == 1 {
-                if self.sidebar_visible && cols > sidebar_w + 4 {
-                    let mut blank = String::new();
-                    while blank.chars().count() < sidebar_w {
-                        blank.push(' ');
-                    }
-                    out.push_str(&blank);
+                if sidebar_on {
+                    out.push_str(&" ".repeat(sidebar_w));
                     out.push_str("\x1b[0m│");
-                    out.push_str(&" ".repeat(editor_w.min(cols)));
-                } else {
-                    out.push_str(&" ".repeat(cols));
+                }
+                out.push_str(&" ".repeat(editor_w.min(cols)));
+                if right_panel_on {
+                    out.push_str("│");
+                    out.push_str(&" ".repeat(right_panel_w));
                 }
                 out.push_str("\r\n");
                 continue;
             }
+
             let doc = self.doc();
             let logical_row = row / line_stride;
             let line_idx = doc.scroll_row + logical_row;
@@ -550,6 +644,7 @@ impl Workspace {
             let clipped_raw: String = text.chars().take(editor_text_w).collect();
             let clipped_raw = apply_ligatures(&clipped_raw, self.ligatures);
             let clipped = languages::syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
+
             if line_idx == doc.row {
                 editor_line.push_str(self.current_line_bg());
                 editor_line.push_str(&clipped);
@@ -557,39 +652,19 @@ impl Workspace {
             } else {
                 editor_line.push_str(&clipped);
             }
-            if self.sidebar_visible && cols > sidebar_w + 4 {
-                let line = self.sidebar_line(logical_row, logical_content_h, sidebar_w);
+
+            if sidebar_on {
+                let line = self.sidebar_line(logical_row, sidebar_w);
                 out.push_str(&line);
                 out.push_str("\x1b[0m│");
-                let clipped: String = editor_line.chars().take(editor_w).collect();
-                out.push_str(&clipped);
             } else {
-                let editor_full_w = self.editor_text_width(cols.saturating_sub(gutter_w).max(1));
-                let text = doc.editor_line_display(line_idx, editor_full_w);
-                let clipped_raw: String = text.chars().take(editor_full_w).collect();
-                let clipped_raw = apply_ligatures(&clipped_raw, self.ligatures);
-                let text = languages::syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
-                let mut line = format!(
-                    "{}{:>width$}{} \x1b[0m{}",
-                    self.gutter_color(),
-                    line_idx.saturating_add(1),
-                    self.line_diagnostic_marker(line_idx).unwrap_or(' '),
-                    text,
-                    width = gutter_w.saturating_sub(1)
-                );
-                if line_idx == doc.row {
-                    line = format!(
-                        "{}{:>width$}{} \x1b[0m{}{}\x1b[0m",
-                        self.gutter_color(),
-                        line_idx.saturating_add(1),
-                        self.line_diagnostic_marker(line_idx).unwrap_or(' '),
-                        self.current_line_bg(),
-                        text,
-                        width = gutter_w.saturating_sub(1)
-                    );
-                }
-                let clipped: String = line.chars().take(cols).collect();
-                out.push_str(&clipped);
+            }
+            let editor_segment = pad_ansi_to_width(&editor_line, editor_w);
+            out.push_str(&editor_segment);
+            if right_panel_on {
+                out.push_str("│");
+                let panel_line = self.right_chat_panel_line(logical_row, logical_content_h, right_panel_w);
+                out.push_str(&panel_line);
             }
             out.push_str("\r\n");
         }
@@ -602,25 +677,26 @@ impl Workspace {
         } else {
             "saved".to_string()
         };
+
         let tx = texts(self.language);
         let focus_hint = match self.focus {
             Focus::Sidebar => tx.hint_sidebar_focus_actions,
             Focus::Tabs => tx.hint_tabs_focus_actions,
             Focus::Editor => tx.hint_sidebar_focus,
+            Focus::RightPanel => "right panel: type prompt | Enter send | Ctrl+C cancel",
         };
+
         let quit_hint = if self.doc().force_quit_pending {
             format!(" {} ", tx.hint_ctrl_q_again_quit)
         } else {
             format!(" {} ", tx.hint_ctrl_q_quit)
         };
-        let tip = self
-            .tip
-            .as_deref()
-            .unwrap_or(focus_hint);
+
+        let tip = self.tip.as_deref().unwrap_or(focus_hint);
         let diag_tip = self.diagnostic_for_current_line();
         let tip = diag_tip.as_deref().unwrap_or(tip);
         let status = format!(
-            "\x1b[7m {} | {} | {}:{} |{}{}{} | {} {} {} {} | {} |{}\x1b[m",
+            "\x1b[7m {} | {} | {}:{} |{}{}{} | {} {} {} {} {} | {} | llm:{} | {}\x1b[m",
             truncate_str(&proj, 18),
             truncate_str(&self.doc().path_display(), 22),
             self.doc().row.saturating_add(1),
@@ -629,27 +705,38 @@ impl Workspace {
             quit_hint,
             tx.hint_ctrl_s_save,
             tx.hint_ctrl_b,
+            tx.hint_ctrl_r,
             tx.hint_shift_tab,
             tx.hint_ctrl_l_lang,
             tx.hint_ctrl_k_help,
             dirty_badge,
-            truncate_str(tip, cols.saturating_sub(78))
+            self.llm_status,
+            truncate_str(tip, cols.saturating_sub(90))
         );
+
         let status: String = status.chars().take(cols).collect();
         out.push_str(&status);
 
         if self.sidebar_menu_open {
             self.render_sidebar_menu_overlay(&mut out, cols, rows);
+        } else if self.agent_unsafe_confirm {
+            self.render_agent_unsafe_confirm_overlay(&mut out, cols, rows);
         } else if self.sidebar_prompt.is_some() {
             self.render_sidebar_prompt_overlay(&mut out, cols, rows);
         } else if self.go_to_line.is_some() {
             self.render_go_to_line_overlay(&mut out, cols, rows);
+        } else if self.llm_prompt.is_some() {
+            self.render_llm_prompt_overlay(&mut out, cols, rows);
         } else if self.multi_edit.is_some() {
             self.render_multi_edit_overlay(&mut out, cols, rows);
         } else if self.sync_edit.is_some() {
             self.render_sync_edit_overlay(&mut out, cols, rows);
         } else if self.command_palette.is_some() {
             self.render_command_palette_overlay(&mut out, cols, rows);
+        } else if self.llm_history_view.is_some() {
+            self.render_llm_history_overlay(&mut out, cols, rows);
+        } else if self.agent_events_view.is_some() {
+            self.render_agent_events_overlay(&mut out, cols, rows);
         } else if self.diagnostics.as_ref().is_some_and(|d| d.open) {
             self.render_diagnostics_overlay(&mut out, cols, rows);
         } else if self.git_view.is_some() {
@@ -664,7 +751,7 @@ impl Workspace {
             self.render_quick_open_overlay(&mut out, cols, rows);
         }
 
-        let (sr, sc) = self.cursor_screen_pos(content_h, cols, sidebar_w, editor_w);
+        let (sr, sc) = self.cursor_screen_pos(content_h, cols, sidebar_w, right_panel_on, right_panel_w);
         out.push_str(&format!("\x1b[{};{}H", sr, sc));
 
         let mut stdout = io::stdout().lock();
@@ -678,7 +765,8 @@ impl Workspace {
         content_h: usize,
         cols: usize,
         sidebar_w: usize,
-        _editor_w: usize,
+        right_panel_on: bool,
+        right_panel_w: usize,
     ) -> (u32, u32) {
         let line_stride = if self.line_spacing { 2usize } else { 1usize };
         let logical_content_h = (content_h / line_stride).max(1);
@@ -686,17 +774,20 @@ impl Workspace {
             let col = self.tab_cursor_col(cols);
             return (1, col.max(1));
         }
+
         if let Some(state) = &self.in_file_find {
             let tx = texts(self.language);
             let prompt = format!("{} {}", tx.find_in_file_prompt, state.query);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if let Some(state) = &self.quick_open {
             let prompt = format!("Quick open: {}", state.query);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if let Some(state) = &self.project_search {
             let mode = if state.regex_mode { "regex" } else { "text" };
             let prefix = if state.edit_replacement {
@@ -704,49 +795,66 @@ impl Workspace {
             } else {
                 format!("[{mode}] search* Search: ",)
             };
+
             let typed_len = if state.edit_replacement {
                 state.replacement.chars().count()
             } else {
                 state.query.chars().count()
             };
+
             let col = prefix.chars().count().saturating_add(typed_len).saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if let Some(state) = &self.symbol_jump {
             let prompt = format!("Symbols: {}", state.query);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if let Some(state) = &self.go_to_line {
             let prompt = format!("Go to line: {}", state.input);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
+        if let Some(state) = &self.llm_prompt {
+            let prompt = format!("{} {}", texts(self.language).llm_ask_prefix, state.input);
+            let col = prompt.chars().count().saturating_add(1) as u32;
+            return (rows_to_u32(content_h + 2), col.max(1));
+        }
+
         if let Some(state) = &self.command_palette {
             let prompt = format!("Command: {}", state.query);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if self.diagnostics.as_ref().is_some_and(|d| d.open) {
             return (rows_to_u32(content_h + 2), 1);
         }
+
         if self.git_view.is_some() {
             return (rows_to_u32(content_h + 2), 1);
         }
+
         if let Some(state) = &self.multi_edit {
             let prompt = format!("Multi-edit '{}' -> {}", state.target, state.replacement);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if let Some(state) = &self.sync_edit {
             let prompt = format!("Sync-edit '{}' -> {}", state.target, state.replacement);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
+
         if self.focus == Focus::Sidebar && self.sidebar_visible && cols > sidebar_w + 4 {
             if self.sidebar_menu_open {
                 return (3, 2);
             }
+
             if let Some(prompt) = &self.sidebar_prompt {
                 let prefix_len = match prompt.kind {
                     SidebarPromptKind::CreateFile => 10usize,
@@ -754,13 +862,31 @@ impl Workspace {
                     SidebarPromptKind::Move => 9usize,
                     SidebarPromptKind::Rename => 11usize,
                 };
+
                 let col = prompt.input.chars().count().saturating_add(prefix_len) as u32;
                 return (rows_to_u32(content_h + 2), col.max(1));
             }
+
             let vis = self.tree_sel.saturating_sub(self.tree_scroll);
-            let r = (vis.min(logical_content_h.saturating_sub(1)) * line_stride + 2) as u32;
+            let tree_h = logical_content_h.max(1);
+            let r = (vis.min(tree_h.saturating_sub(1)) * line_stride + 2) as u32;
             let c = (self.tree.get(self.tree_sel).map(|e| e.depth * 2 + 2).unwrap_or(2) as u32).min(sidebar_w as u32);
             (r, c.max(1))
+        } else if self.focus == Focus::RightPanel && right_panel_on {
+            let prompt = format!("> {}", self.right_panel_input);
+            let col_in_panel = prompt.chars().count().saturating_add(1);
+            let left = if self.sidebar_visible && cols > sidebar_w + 4 {
+                sidebar_w + 1
+            } else {
+                0
+            };
+            let editor_w = Self::editor_width(cols, self.sidebar_visible && cols > sidebar_w + 4, right_panel_on);
+            let panel_row = logical_content_h.saturating_sub(1) * line_stride + 2;
+            let panel_col = left + editor_w + 2 + col_in_panel;
+            (
+                rows_to_u32(panel_row),
+                (panel_col.min(left + editor_w + 1 + right_panel_w)).max(1) as u32,
+            )
         } else {
             let doc = self.doc();
             let doc_row = doc.row.saturating_sub(doc.scroll_row);
@@ -771,12 +897,13 @@ impl Workspace {
             } else {
                 gutter_w
             };
+
             let c = col_off + (doc.col.saturating_sub(doc.hscroll) as u32) + 1;
             (r, c.max(1))
         }
     }
 
-    fn sidebar_line(&self, row: usize, _content_h: usize, sidebar_w: usize) -> String {
+    fn sidebar_line(&self, row: usize, sidebar_w: usize) -> String {
         let idx = self.tree_scroll + row;
         let mut s = String::new();
         if let Some(e) = self.tree.get(idx) {
@@ -802,24 +929,53 @@ impl Workspace {
                 s.push(' ');
             }
         }
+
         let total: String = s.chars().take(sidebar_w).collect();
         total
     }
 
     fn adjust_tree_scroll(&mut self, content_h: usize) {
+        let tree_h = content_h.max(1);
         if self.tree_sel < self.tree_scroll {
             self.tree_scroll = self.tree_sel;
         }
-        if self.tree_sel >= self.tree_scroll + content_h {
-            self.tree_scroll = self.tree_sel + 1 - content_h;
+
+        if self.tree_sel >= self.tree_scroll + tree_h {
+            self.tree_scroll = self.tree_sel + 1 - tree_h;
         }
     }
 
-    /// `true` = quit app
+    fn right_chat_panel_line(&self, row: usize, content_h: usize, panel_w: usize) -> String {
+        let mut s = String::new();
+        if row == 0 {
+            s.push_str(" LLM Chat");
+        } else if row + 1 >= content_h {
+            s.push_str(&format!("> {}", self.right_panel_input));
+        } else {
+            let body_rows = content_h.saturating_sub(2);
+            let total = self.llm_history.len();
+            let start = total.saturating_sub(body_rows);
+            let idx = start + row.saturating_sub(1);
+            if let Some(item) = self.llm_history.get(idx) {
+                let role = if item.role == "user" { "U" } else { "A" };
+                let one_line = item.content.lines().next().unwrap_or("");
+                s.push_str(&format!(" {role}: {}", one_line.trim()));
+            }
+        }
+
+        let max_w = panel_w.saturating_sub(1);
+        s = s.chars().take(max_w).collect();
+        while s.chars().count() < panel_w {
+            s.push(' ');
+        }
+        s.chars().take(panel_w).collect()
+    }
+
+    /// `true` = завершить приложение
     pub fn handle_key(&mut self, key: Key) -> io::Result<bool> {
         if self.hotkeys_help {
             match key {
-                Key::CtrlK => {
+                Key::CtrlH => {
                     self.hotkeys_help = false;
                 }
                 Key::CtrlQ => return self.doc_mut().handle_key(key),
@@ -855,6 +1011,24 @@ impl Workspace {
         }
 
         self.tip = None;
+        self.poll_llm_inflight();
+        self.poll_agent_inflight();
+        if !Self::llm_enabled_in_settings() {
+            self.right_panel_visible = false;
+            if self.focus == Focus::RightPanel {
+                self.focus = Focus::Editor;
+            }
+        }
+
+        if matches!(key, Key::CtrlC) && self.llm_inflight.is_some() {
+            self.cancel_llm_inflight();
+            return Ok(false);
+        }
+
+        if self.agent_unsafe_confirm {
+            self.handle_agent_unsafe_confirm_key(key);
+            return Ok(false);
+        }
 
         if self.sidebar_prompt.is_some() {
             self.handle_sidebar_prompt_key(key);
@@ -865,38 +1039,62 @@ impl Workspace {
             self.handle_quick_open_key(key);
             return Ok(false);
         }
+
         if self.in_file_find.is_some() {
             self.handle_in_file_find_key(key);
             return Ok(false);
         }
+        
         if self.project_search.is_some() {
             self.handle_project_search_key(key);
             return Ok(false);
         }
+
         if self.symbol_jump.is_some() {
             self.handle_symbol_jump_key(key);
             return Ok(false);
         }
+
         if self.go_to_line.is_some() {
             self.handle_go_to_line_key(key);
             return Ok(false);
         }
+
+        if self.llm_prompt.is_some() {
+            self.handle_llm_prompt_key(key);
+            return Ok(false);
+        }
+
         if self.multi_edit.is_some() {
             self.handle_multi_edit_key(key);
             return Ok(false);
         }
+
         if self.sync_edit.is_some() {
             self.handle_sync_edit_key(key);
             return Ok(false);
         }
+
         if self.command_palette.is_some() {
             self.handle_command_palette_key(key);
             return Ok(false);
         }
+
+        if self.llm_history_view.is_some() {
+            self.handle_llm_history_view_key(key);
+            return Ok(false);
+        }
+
+        if self.agent_events_view.is_some() {
+            self.handle_agent_events_view_key(key);
+            return Ok(false);
+        }
+
         if self.diagnostics.as_ref().is_some_and(|d| d.open) {
             self.handle_diagnostics_key(key);
             return Ok(false);
         }
+
         if self.git_view.is_some() {
             self.handle_git_view_key(key);
             return Ok(false);
@@ -910,30 +1108,37 @@ impl Workspace {
         if matches!(key, Key::CtrlQ) {
             return self.doc_mut().handle_key(key);
         }
+
         if matches!(key, Key::CtrlS) {
             self.doc_mut().save()?;
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlA) {
             self.navigate_back();
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlZ) {
             self.navigate_forward();
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlP) {
             self.next_tab();
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlU) {
             self.prev_tab();
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlW) {
             self.close_active_tab();
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlX) {
             self.toggle_pin_active_tab();
             return Ok(false);
@@ -947,23 +1152,46 @@ impl Workspace {
             return Ok(false);
         }
 
+        if matches!(key, Key::CtrlR) {
+            if Self::llm_enabled_in_settings() {
+                self.right_panel_visible = !self.right_panel_visible;
+            } else {
+                self.right_panel_visible = false;
+                self.tip = Some(texts(self.language).llm_disabled.to_string());
+            }
+            if !self.right_panel_visible && self.focus == Focus::RightPanel {
+                self.focus = Focus::Editor;
+            }
+            return Ok(false);
+        }
+
         if matches!(key, Key::CtrlL) {
             self.language_picker = true;
             self.language_sel = if self.language == Language::En { 0 } else { 1 };
             return Ok(false);
         }
-        if matches!(key, Key::CtrlK) {
+
+        if matches!(key, Key::CtrlH) {
             self.hotkeys_help = true;
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlO) {
             self.quick_open = Some(QuickOpenState::default());
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlF) {
             self.project_search = Some(ProjectSearchState::default());
             return Ok(false);
         }
+
+        if matches!(key, Key::CtrlG) {
+            self.llm_prompt = Some(LlmPromptState::default());
+            self.focus = Focus::Editor;
+            return Ok(false);
+        }
+
         if matches!(key, Key::CtrlBackslash) {
             let w = self.word_under_cursor();
             let seed = if w.chars().count() > 80 {
@@ -971,36 +1199,44 @@ impl Workspace {
             } else {
                 w
             };
+            
             self.in_file_find = Some(InFileFindState {
                 query: seed,
                 sel: 0,
             });
+
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlT) {
             self.symbol_jump = Some(SymbolJumpState::default());
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlY) {
             self.go_to_line = Some(GoToLineState::default());
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlD) {
             let target = self.word_under_cursor();
             if target.is_empty() {
-                self.tip = Some("No word under cursor".to_string());
+                self.tip = Some(texts(self.language).tip_no_word_under_cursor.to_string());
             } else {
                 self.multi_edit = Some(MultiEditState {
                     target,
                     replacement: String::new(),
                 });
             }
+
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlE) {
             self.start_sync_edit();
             return Ok(false);
         }
+
         if matches!(key, Key::CtrlJ) && self.focus != Focus::Tabs {
             self.command_palette = Some(CommandPaletteState::default());
             return Ok(false);
@@ -1011,6 +1247,7 @@ impl Workspace {
                 self.move_tab_left(self.active_doc);
                 return Ok(false);
             }
+
             if matches!(key, Key::CtrlArrowRight) {
                 self.move_tab_right(self.active_doc);
                 return Ok(false);
@@ -1032,6 +1269,11 @@ impl Workspace {
             return Ok(false);
         }
 
+        if self.focus == Focus::RightPanel {
+            self.handle_right_panel_key(key);
+            return Ok(false);
+        }
+
         if self.focus == Focus::Tabs {
             self.handle_tabs_key(key);
             return Ok(false);
@@ -1044,7 +1286,7 @@ impl Workspace {
                 if let Err(err) = self.doc_mut().save() {
                     self.tip = Some(format!("{}: {err}", texts(self.language).error_prefix));
                 } else {
-                    self.tip = Some("Autosaved".to_string());
+                    self.tip = Some(texts(self.language).tip_autosaved.to_string());
                 }
             }
         }
@@ -1055,6 +1297,7 @@ impl Workspace {
         if !matches!(key, Key::Delete) {
             self.pending_delete_path = None;
         }
+
         match key {
             Key::ArrowUp => {
                 if self.tree_sel > 0 {
@@ -1099,6 +1342,35 @@ impl Workspace {
             Key::Char('P') | Key::Char('p') => {
                 self.toggle_pick_drop_move();
             }
+            Key::Char('G') | Key::Char('g') => {
+                self.llm_prompt = Some(LlmPromptState::default());
+                self.focus = Focus::Editor;
+            }
+            Key::Char('H') | Key::Char('h') => {
+                self.llm_history_view = Some(LlmHistoryViewState::default());
+            }
+            Key::Char('E') | Key::Char('e') => {
+                self.agent_events_view = Some(AgentEventsViewState::default());
+            }
+            Key::Char('U') | Key::Char('u') => {
+                if self.agent_allow_unsafe_tools {
+                    self.agent_allow_unsafe_tools = false;
+                    self.tip = Some(texts(self.language).agent_unsafe_disabled.to_string());
+                } else {
+                    self.agent_unsafe_confirm = true;
+                    self.tip = Some(texts(self.language).agent_unsafe_confirm_tip.to_string());
+                }
+            }
+            Key::Char('L') | Key::Char('l') => {
+                self.run_agent_loop_mvp();
+            }
+            Key::Char('C') | Key::Char('c') => {
+                self.llm_history.clear();
+                self.tip = Some(texts(self.language).llm_history_cleared.to_string());
+            }
+            Key::Char('I') | Key::Char('i') => {
+                self.insert_last_llm_answer();
+            }
             _ => {}
         }
     }
@@ -1107,48 +1379,50 @@ impl Workspace {
         let Some(selected) = self.tree.get(self.tree_sel) else {
             return;
         };
+
         let selected_path = selected.path.clone();
         if self.move_pick_path.is_none() {
             self.move_pick_path = Some(selected_path);
-            self.tip = Some("Move picked. Navigate and press P to drop".to_string());
+            self.tip = Some(texts(self.language).tip_move_picked.to_string());
             return;
         }
 
         let Some(from) = self.move_pick_path.as_ref().cloned() else {
             return;
         };
+
         if from == selected_path {
             self.move_pick_path = None;
-            self.tip = Some("Move cancelled".to_string());
+            self.tip = Some(texts(self.language).tip_move_cancelled.to_string());
             return;
         }
 
         let mut target_dir = if selected.is_dir {
             selected.path.clone()
         } else {
-            selected
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.project_root.clone())
+            selected.path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.project_root.clone())
         };
+
         if !target_dir.is_absolute() {
             target_dir = self.project_root.join(target_dir);
         }
+
         let Some(name) = from.file_name() else {
             self.move_pick_path = None;
-            self.tip = Some("Invalid source".to_string());
+            self.tip = Some(texts(self.language).tip_invalid_source.to_string());
             return;
         };
+
         let to = target_dir.join(name);
         if to == from {
             self.move_pick_path = None;
-            self.tip = Some("Source and target are the same".to_string());
+            self.tip = Some(texts(self.language).tip_source_target_same.to_string());
             return;
         }
+
         if to.exists() {
             self.move_pick_path = None;
-            self.tip = Some("Target already exists".to_string());
+            self.tip = Some(texts(self.language).tip_target_exists.to_string());
             return;
         }
 
@@ -1159,7 +1433,7 @@ impl Workspace {
                 if let Err(err) = self.refresh_tree(Some(to)) {
                     self.tip = Some(format!("{}: {err}", texts(self.language).error_prefix));
                 } else {
-                    self.tip = Some("Moved".to_string());
+                    self.tip = Some(texts(self.language).tip_moved.to_string());
                 }
             }
             Err(err) => {
@@ -1173,6 +1447,7 @@ impl Workspace {
         if self.docs.is_empty() {
             return;
         }
+
         match key {
             Key::ArrowLeft => {
                 if self.tab_sel == 0 {
@@ -1207,12 +1482,14 @@ impl Workspace {
         if self.docs.len() < 2 || idx == 0 || idx >= self.docs.len() {
             return;
         }
+
         self.docs.swap(idx, idx - 1);
         if self.active_doc == idx {
             self.active_doc = idx - 1;
         } else if self.active_doc == idx - 1 {
             self.active_doc = idx;
         }
+
         self.tab_sel = idx - 1;
         self.persist_session();
     }
@@ -1221,12 +1498,14 @@ impl Workspace {
         if self.docs.len() < 2 || idx + 1 >= self.docs.len() {
             return;
         }
+
         self.docs.swap(idx, idx + 1);
         if self.active_doc == idx {
             self.active_doc = idx + 1;
         } else if self.active_doc == idx + 1 {
             self.active_doc = idx;
         }
+
         self.tab_sel = idx + 1;
         self.persist_session();
     }
@@ -1323,7 +1602,7 @@ impl Workspace {
                 self.sidebar_prompt = None;
 
                 if input.is_empty() {
-                    self.tip = Some("Name is empty".to_string());
+                    self.tip = Some(texts(self.language).tip_name_empty.to_string());
                     return;
                 }
 
@@ -1338,22 +1617,26 @@ impl Workspace {
                     }
                     SidebarPromptKind::Move => {
                         let Some(from) = target_path else {
-                            self.tip = Some("No selected target".to_string());
+                            self.tip = Some(texts(self.language).tip_no_selected_target.to_string());
                             return;
                         };
+
                         let mut to = PathBuf::from(&input);
                         if !to.is_absolute() {
                             to = self.project_root.join(to);
                         }
+
                         if to.is_dir() {
                             if let Some(name) = from.file_name() {
                                 to = to.join(name);
                             }
                         }
+
                         if to.exists() {
-                            self.tip = Some("Target already exists".to_string());
+                            self.tip = Some(texts(self.language).tip_target_exists.to_string());
                             return;
                         }
+
                         fs::rename(&from, &to).map(|_| {
                             self.remap_open_documents_after_move(&from, &to);
                             to
@@ -1361,7 +1644,7 @@ impl Workspace {
                     }
                     SidebarPromptKind::Rename => {
                         let Some(from) = target_path else {
-                            self.tip = Some("No selected target".to_string());
+                            self.tip = Some(texts(self.language).tip_no_selected_target.to_string());
                             return;
                         };
                         let to = base_dir.join(&input);
@@ -1413,16 +1696,13 @@ impl Workspace {
     }
 
     fn open_file_in_tab(&mut self, path: PathBuf) -> io::Result<()> {
-        if let Some(idx) = self
-            .docs
-            .iter()
-            .position(|d| d.path.as_ref().is_some_and(|p| p == &path))
-        {
+        if let Some(idx) = self.docs.iter().position(|d| d.path.as_ref().is_some_and(|p| p == &path)) {
             self.active_doc = idx;
             self.tab_sel = idx;
             self.persist_session();
             return Ok(());
         }
+
         let doc = Document::open_file(path)?;
         self.docs.push(doc);
         self.active_doc = self.docs.len().saturating_sub(1);
@@ -1435,6 +1715,7 @@ impl Workspace {
         if self.docs.len() < 2 {
             return;
         }
+
         self.active_doc = (self.active_doc + 1) % self.docs.len();
         self.tab_sel = self.active_doc;
         self.persist_session();
@@ -1444,11 +1725,13 @@ impl Workspace {
         if self.docs.len() < 2 {
             return;
         }
+
         self.active_doc = if self.active_doc == 0 {
             self.docs.len() - 1
         } else {
             self.active_doc - 1
         };
+
         self.tab_sel = self.active_doc;
         self.persist_session();
     }
@@ -1464,13 +1747,16 @@ impl Workspace {
             self.tab_sel = 0;
             return;
         }
+
         if idx >= self.docs.len() {
             return;
         }
+
         if self.docs[idx].pinned {
-            self.tip = Some("Tab is pinned. Press Ctrl+X to unpin".to_string());
+            self.tip = Some(texts(self.language).tip_tab_is_pinned.to_string());
             return;
         }
+
         if self.docs[idx].dirty {
             self.tip = Some(texts(self.language).save_or_quit_double.into());
             return;
@@ -1485,7 +1771,7 @@ impl Workspace {
             self.active_doc = 0;
             self.tab_sel = 0;
         } else {
-            // Prefer right neighbor when closing active tab, otherwise keep current active tab
+            // При закрытии активного таба предпочитаем правого соседа, иначе оставляем текущий активный таб
             self.active_doc = if was_active {
                 idx.min(self.docs.len().saturating_sub(1))
             } else if idx < old_active {
@@ -1506,11 +1792,7 @@ impl Workspace {
     }
 
     fn close_document_by_path(&mut self, path: &Path) {
-        if let Some(idx) = self
-            .docs
-            .iter()
-            .position(|d| d.path.as_ref().is_some_and(|p| p == path))
-        {
+        if let Some(idx) = self.docs.iter().position(|d| d.path.as_ref().is_some_and(|p| p == path)) {
             let old_active = self.active_doc;
             let old_tab_sel = self.tab_sel;
             self.docs.remove(idx);
@@ -1524,6 +1806,7 @@ impl Workspace {
                 } else {
                     old_active.min(self.docs.len().saturating_sub(1))
                 };
+
                 self.tab_sel = if idx < old_tab_sel {
                     old_tab_sel.saturating_sub(1)
                 } else {
@@ -1537,12 +1820,7 @@ impl Workspace {
     fn persist_session(&self) {
         let tabs: Vec<PathBuf> = self.docs.iter().filter_map(|d| d.path.clone()).collect();
         let active = self.docs.get(self.active_doc).and_then(|d| d.path.as_ref());
-        let pinned: Vec<PathBuf> = self
-            .docs
-            .iter()
-            .filter(|d| d.pinned)
-            .filter_map(|d| d.path.clone())
-            .collect();
+        let pinned: Vec<PathBuf> = self.docs.iter().filter(|d| d.pinned).filter_map(|d| d.path.clone()).collect();
         let _ = session::save_project_session(&self.project_root, &tabs, active, &pinned);
     }
 
@@ -1550,14 +1828,16 @@ impl Workspace {
         if self.docs.is_empty() {
             return;
         }
+
         let idx = self.active_doc.min(self.docs.len().saturating_sub(1));
         let doc = &mut self.docs[idx];
         doc.pinned = !doc.pinned;
         self.tip = Some(if doc.pinned {
-            "Tab pinned".to_string()
+            texts(self.language).tip_tab_pinned.to_string()
         } else {
-            "Tab unpinned".to_string()
+            texts(self.language).tip_tab_unpinned.to_string()
         });
+
         self.persist_session();
     }
 
@@ -1575,9 +1855,11 @@ impl Workspace {
         let Some(loc) = self.current_nav_location() else {
             return;
         };
+
         if self.nav_back.last() == Some(&loc) {
             return;
         }
+
         self.nav_back.push(loc);
         if self.nav_back.len() > 256 {
             let _ = self.nav_back.remove(0);
@@ -1589,10 +1871,12 @@ impl Workspace {
             self.push_current_to_back_history();
             self.nav_forward.clear();
         }
+
         if let Err(err) = self.open_file_in_tab(path.clone()) {
             self.tip = Some(format!("{}: {err}", texts(self.language).error_prefix));
             return;
         }
+
         self.focus = Focus::Editor;
         {
             let doc = self.doc_mut();
@@ -1600,6 +1884,7 @@ impl Workspace {
             doc.col = col;
             doc.clamp_cursor();
         }
+
         let _ = self.refresh_tree(Some(path));
     }
 
@@ -1608,6 +1893,7 @@ impl Workspace {
             self.push_current_to_back_history();
             self.nav_forward.clear();
         }
+
         let doc = self.doc_mut();
         doc.row = row.min(doc.buffer.line_count().saturating_sub(1));
         doc.col = col;
@@ -1617,35 +1903,40 @@ impl Workspace {
 
     fn navigate_back(&mut self) {
         let Some(target) = self.nav_back.pop() else {
-            self.tip = Some("No back history".to_string());
+            self.tip = Some(texts(self.language).tip_no_back_history.to_string());
             return;
         };
+
         if let Some(cur) = self.current_nav_location() {
             if self.nav_forward.last() != Some(&cur) {
                 self.nav_forward.push(cur);
             }
         }
+
         self.jump_to_path_position(target.path, target.row, target.col, false);
     }
 
     fn navigate_forward(&mut self) {
         let Some(target) = self.nav_forward.pop() else {
-            self.tip = Some("No forward history".to_string());
+            self.tip = Some(texts(self.language).tip_no_forward_history.to_string());
             return;
         };
+
         if let Some(cur) = self.current_nav_location() {
             if self.nav_back.last() != Some(&cur) {
                 self.nav_back.push(cur);
             }
         }
+
         self.jump_to_path_position(target.path, target.row, target.col, false);
     }
 
     fn start_create_prompt(&mut self, folder: bool) {
         let Some(base_dir) = self.selected_parent_dir() else {
-            self.tip = Some("Folder not found".to_string());
+            self.tip = Some(texts(self.language).tip_folder_not_found.to_string());
             return;
         };
+
         self.sidebar_prompt = Some(SidebarPrompt {
             kind: if folder {
                 SidebarPromptKind::CreateFolder
@@ -1662,6 +1953,7 @@ impl Workspace {
         let Some(selected) = self.tree.get(self.tree_sel) else {
             return;
         };
+
         let base_dir = selected
             .path
             .parent()
@@ -1679,12 +1971,14 @@ impl Workspace {
         let Some(selected) = self.tree.get(self.tree_sel) else {
             return;
         };
+
         let default_input = selected
             .path
             .strip_prefix(&self.project_root)
             .ok()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| selected.path.to_string_lossy().to_string());
+
         self.sidebar_prompt = Some(SidebarPrompt {
             kind: SidebarPromptKind::Move,
             base_dir: self.project_root.clone(),
@@ -1698,10 +1992,12 @@ impl Workspace {
             let Some(path) = doc.path.as_ref().cloned() else {
                 continue;
             };
+
             if &path == from {
                 doc.path = Some(to.to_path_buf());
                 continue;
             }
+
             if let Ok(rel) = path.strip_prefix(from) {
                 doc.path = Some(to.join(rel));
             }
@@ -1712,11 +2008,12 @@ impl Workspace {
         let Some(selected) = self.tree.get(self.tree_sel) else {
             return;
         };
+
         let selected_path = selected.path.clone();
         let is_dir = selected.is_dir;
         if self.pending_delete_path.as_ref() != Some(&selected_path) {
             self.pending_delete_path = Some(selected_path.clone());
-            self.tip = Some("Press Delete again to confirm".to_string());
+            self.tip = Some(texts(self.language).tip_delete_confirm.to_string());
             return;
         }
 
@@ -1737,6 +2034,7 @@ impl Workspace {
                 if self.doc().path.as_ref() == Some(&selected_path) {
                     self.close_document_by_path(&selected_path);
                 }
+
                 if let Err(err) = self.refresh_tree(None) {
                     self.tip = Some(format!("{}: {err}", texts(self.language).error_prefix));
                 }
@@ -1768,6 +2066,7 @@ impl Workspace {
         } else {
             self.tree_sel = self.tree_sel.min(self.tree.len().saturating_sub(1));
         }
+
         Ok(())
     }
 
@@ -1861,6 +2160,7 @@ impl Workspace {
         if self.in_file_find.is_none() {
             return;
         }
+
         match key {
             Key::Esc | Key::CtrlBackslash => {
                 self.in_file_find = None;
@@ -1942,6 +2242,7 @@ impl Workspace {
         let Some(state) = self.in_file_find.as_ref() else {
             return Vec::new();
         };
+
         Self::buffer_match_positions(self.doc(), &state.query)
     }
 
@@ -1949,17 +2250,20 @@ impl Workspace {
         if query.is_empty() {
             return Vec::new();
         }
+
         let needle: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
         let n = needle.len();
         if n == 0 {
             return Vec::new();
         }
+
         let mut out = Vec::new();
         for (ri, line) in doc.buffer.lines().iter().enumerate() {
             let line_l: Vec<char> = line.chars().flat_map(|c| c.to_lowercase()).collect();
             if line_l.len() < n {
                 continue;
             }
+
             let last = line_l.len() - n;
             for i in 0..=last {
                 if line_l[i..i + n] == needle[..] {
@@ -2068,20 +2372,20 @@ impl Workspace {
                 return;
             };
             if state.replacement.is_empty() {
-                self.tip = Some("Type replacement text first".to_string());
+                self.tip = Some(texts(self.language).tip_replace_text_first.to_string());
                 return;
             }
             if matches.is_empty() {
-                self.tip = Some("No search matches to replace".to_string());
+                self.tip = Some(texts(self.language).tip_no_search_matches_replace.to_string());
                 return;
             }
             let idx = state.sel.min(matches.len().saturating_sub(1));
             let hit = matches[idx].clone();
             let changed = self.apply_replace_current(&hit);
             if changed {
-                self.tip = Some("Replaced current match".to_string());
+                self.tip = Some(texts(self.language).tip_replaced_current_match.to_string());
             } else {
-                self.tip = Some("Current match was not replaced".to_string());
+                self.tip = Some(texts(self.language).tip_current_not_replaced.to_string());
             }
             return;
         }
@@ -2091,12 +2395,12 @@ impl Workspace {
             };
             if state.replacement.is_empty() {
                 state.edit_replacement = true;
-                self.tip = Some("Type replacement first, then Ctrl+R again".to_string());
+                self.tip = Some(texts(self.language).tip_replace_first_then_ctrl_r.to_string());
                 return;
             }
             if !state.confirm_replace_all {
                 state.confirm_replace_all = true;
-                self.tip = Some("Press Enter to confirm replace all".to_string());
+                self.tip = Some(texts(self.language).tip_press_enter_confirm_replace_all.to_string());
                 return;
             }
         }
@@ -2414,6 +2718,35 @@ impl Workspace {
         }
     }
 
+    fn handle_llm_prompt_key(&mut self, key: Key) {
+        let Some(state) = self.llm_prompt.as_mut() else {
+            return;
+        };
+        match key {
+            Key::Esc | Key::CtrlY => {
+                self.llm_prompt = None;
+                self.focus = Focus::Editor;
+            }
+            Key::Backspace => {
+                state.input.pop();
+            }
+            Key::Char(ch) => {
+                state.input.push(ch);
+            }
+            Key::Enter => {
+                let prompt = state.input.trim().to_string();
+                self.llm_prompt = None;
+                self.focus = Focus::Editor;
+                if prompt.is_empty() {
+                    self.tip = Some(texts(self.language).llm_prompt_empty.to_string());
+                    return;
+                }
+                self.run_llm_prompt(prompt);
+            }
+            _ => {}
+        }
+    }
+
     fn handle_multi_edit_key(&mut self, key: Key) {
         let Some(state) = self.multi_edit.as_mut() else {
             return;
@@ -2433,9 +2766,9 @@ impl Workspace {
                 let replacement = state.replacement.clone();
                 let count = self.replace_word_in_current_doc(&target, &replacement);
                 if count == 0 {
-                    self.tip = Some("No occurrences replaced".to_string());
+                    self.tip = Some(texts(self.language).tip_no_occurrences_replaced.to_string());
                 } else {
-                    self.tip = Some(format!("Multi-edit replaced {count} occurrences"));
+                    self.tip = Some(texts(self.language).tip_multi_edit_replaced_fmt.replace("{}", &count.to_string()));
                 }
                 self.multi_edit = None;
             }
@@ -2499,18 +2832,18 @@ impl Workspace {
     fn start_sync_edit(&mut self) {
         let target = self.word_under_cursor();
         if target.is_empty() {
-            self.tip = Some("No word under cursor".to_string());
+            self.tip = Some(texts(self.language).tip_no_word_under_cursor.to_string());
             return;
         }
         let original_text = self.doc().buffer.to_file_string();
         let re = whole_word_regex(&target);
         let Some(re) = re else {
-            self.tip = Some("Cannot start sync edit for this word".to_string());
+            self.tip = Some(texts(self.language).tip_cannot_start_sync_edit.to_string());
             return;
         };
         let occurrences = re.find_iter(&original_text).count();
         if occurrences == 0 {
-            self.tip = Some("No occurrences found".to_string());
+            self.tip = Some(texts(self.language).tip_no_occurrences_found.to_string());
             return;
         }
         self.sync_edit = Some(SyncEditState {
@@ -2567,30 +2900,45 @@ impl Workspace {
     }
 
     fn command_palette_items(&self) -> Vec<(&'static str, &'static str)> {
+        let llm_enabled = Self::llm_enabled_in_settings();
         let mut items = vec![
-            ("Toggle Sidebar", "toggle_sidebar"),
-            ("Toggle Theme", "toggle_theme"),
-            ("Toggle Autosave", "toggle_autosave"),
-            ("Rust Check Current File", "rust_check_current"),
-            ("Show Diagnostics", "show_diagnostics"),
-            ("Increase Font Size", "font_plus"),
-            ("Decrease Font Size", "font_minus"),
-            ("Toggle Line Spacing", "toggle_line_spacing"),
-            ("Toggle Ligatures", "toggle_ligatures"),
-            ("Quick Open File", "quick_open"),
-            ("Search in Project", "project_search"),
-            ("Go to Symbol", "go_symbol"),
-            ("Go to Line", "go_line"),
-            ("Toggle Pin Tab", "toggle_pin"),
-            ("Show Hotkeys", "show_help"),
-            ("Language Picker", "language_picker"),
-            ("LSP First-Wave Extensions", "lsp_wave_extensions"),
-            ("Find in File", "in_file_find"),
-            ("Git: Status", "git_status"),
-            ("Git: Diff (unstaged)", "git_diff_unstaged"),
-            ("Git: Diff (staged)", "git_diff_staged"),
-            ("Git: Recent commits", "git_log"),
+            (texts(self.language).cmd_toggle_sidebar, "toggle_sidebar"),
+            (texts(self.language).cmd_toggle_right_panel, "toggle_right_panel"),
+            (texts(self.language).cmd_toggle_theme, "toggle_theme"),
+            (texts(self.language).cmd_toggle_autosave, "toggle_autosave"),
+            (texts(self.language).cmd_rust_check_current, "rust_check_current"),
+            (texts(self.language).cmd_show_diagnostics, "show_diagnostics"),
+            (texts(self.language).cmd_increase_font, "font_plus"),
+            (texts(self.language).cmd_decrease_font, "font_minus"),
+            (texts(self.language).cmd_toggle_line_spacing, "toggle_line_spacing"),
+            (texts(self.language).cmd_toggle_ligatures, "toggle_ligatures"),
+            (texts(self.language).cmd_quick_open_file, "quick_open"),
+            (texts(self.language).cmd_search_in_project, "project_search"),
+            (texts(self.language).cmd_go_to_symbol, "go_symbol"),
+            (texts(self.language).cmd_go_to_line, "go_line"),
+            (texts(self.language).cmd_toggle_pin_tab, "toggle_pin"),
+            (texts(self.language).cmd_show_hotkeys, "show_help"),
+            (texts(self.language).cmd_language_picker, "language_picker"),
+            (texts(self.language).cmd_lsp_wave, "lsp_wave_extensions"),
+            (texts(self.language).cmd_find_in_file, "in_file_find"),
+            (texts(self.language).cmd_git_status, "git_status"),
+            (texts(self.language).cmd_git_diff_unstaged, "git_diff_unstaged"),
+            (texts(self.language).cmd_git_diff_staged, "git_diff_staged"),
+            (texts(self.language).cmd_git_recent_commits, "git_log"),
         ];
+        if llm_enabled {
+            items.extend_from_slice(&[
+                (texts(self.language).cmd_llm_ask, "llm_ask"),
+                (texts(self.language).cmd_llm_show_history, "llm_history"),
+                (texts(self.language).cmd_agent_show_events, "agent_events"),
+                (texts(self.language).cmd_agent_toggle_unsafe_tools, "agent_toggle_unsafe_tools"),
+                (texts(self.language).cmd_llm_clear_history, "llm_history_clear"),
+                (texts(self.language).cmd_llm_insert_last_answer, "llm_insert_last_answer"),
+                (texts(self.language).cmd_llm_health_check, "llm_health"),
+                (texts(self.language).cmd_llm_explain_current_line, "llm_explain_current_line"),
+                (texts(self.language).cmd_agent_run_loop, "agent_run_loop"),
+            ]);
+        }
         if let Some(state) = &self.command_palette {
             let q = state.query.to_lowercase();
             if !q.is_empty() {
@@ -2675,13 +3023,24 @@ impl Workspace {
                     self.focus = Focus::Editor;
                 }
             }
+            "toggle_right_panel" => {
+                if Self::llm_enabled_in_settings() {
+                    self.right_panel_visible = !self.right_panel_visible;
+                } else {
+                    self.right_panel_visible = false;
+                    self.tip = Some(texts(self.language).llm_disabled.to_string());
+                }
+                if !self.right_panel_visible && self.focus == Focus::RightPanel {
+                    self.focus = Focus::Editor;
+                }
+            }
             "toggle_theme" => self.dark_theme = !self.dark_theme,
             "toggle_autosave" => {
                 self.autosave_on_edit = !self.autosave_on_edit;
                 self.tip = Some(if self.autosave_on_edit {
-                    "Autosave enabled".to_string()
+                    texts(self.language).tip_autosave_enabled.to_string()
                 } else {
-                    "Autosave disabled".to_string()
+                    texts(self.language).tip_autosave_disabled.to_string()
                 });
             }
             "rust_check_current" => {
@@ -2691,37 +3050,54 @@ impl Workspace {
                 if let Some(d) = self.diagnostics.as_mut() {
                     d.open = true;
                 } else {
-                    self.tip = Some("No diagnostics yet".to_string());
+                    self.tip = Some(texts(self.language).tip_no_diagnostics_yet.to_string());
                 }
             }
             "font_plus" => {
                 self.font_zoom = (self.font_zoom + 1).min(4);
-                self.tip = Some(format!("Font zoom: {}", self.font_zoom));
+                self.tip = Some(texts(self.language).tip_font_zoom_fmt.replace("{}", &self.font_zoom.to_string()));
             }
             "font_minus" => {
                 self.font_zoom = (self.font_zoom - 1).max(-2);
-                self.tip = Some(format!("Font zoom: {}", self.font_zoom));
+                self.tip = Some(texts(self.language).tip_font_zoom_fmt.replace("{}", &self.font_zoom.to_string()));
             }
             "toggle_line_spacing" => {
                 self.line_spacing = !self.line_spacing;
                 self.tip = Some(if self.line_spacing {
-                    "Line spacing: comfortable".to_string()
+                    texts(self.language).tip_line_spacing_comfortable.to_string()
                 } else {
-                    "Line spacing: compact".to_string()
+                    texts(self.language).tip_line_spacing_compact.to_string()
                 });
             }
             "toggle_ligatures" => {
                 self.ligatures = !self.ligatures;
                 self.tip = Some(if self.ligatures {
-                    "Ligatures: on".to_string()
+                    texts(self.language).tip_ligatures_on.to_string()
                 } else {
-                    "Ligatures: off".to_string()
+                    texts(self.language).tip_ligatures_off.to_string()
                 });
             }
             "quick_open" => self.quick_open = Some(QuickOpenState::default()),
             "project_search" => self.project_search = Some(ProjectSearchState::default()),
             "go_symbol" => self.symbol_jump = Some(SymbolJumpState::default()),
             "go_line" => self.go_to_line = Some(GoToLineState::default()),
+            "llm_ask" => self.llm_prompt = Some(LlmPromptState::default()),
+            "llm_history" => self.llm_history_view = Some(LlmHistoryViewState::default()),
+            "agent_events" => self.agent_events_view = Some(AgentEventsViewState::default()),
+            "agent_toggle_unsafe_tools" => {
+                if self.agent_allow_unsafe_tools {
+                    self.agent_allow_unsafe_tools = false;
+                    self.tip = Some(texts(self.language).agent_unsafe_disabled.to_string());
+                } else {
+                    self.agent_unsafe_confirm = true;
+                    self.tip = Some(texts(self.language).agent_unsafe_confirm_tip.to_string());
+                }
+            }
+            "llm_history_clear" => {
+                self.llm_history.clear();
+                self.tip = Some(texts(self.language).llm_history_cleared.to_string());
+            }
+            "llm_insert_last_answer" => self.insert_last_llm_answer(),
             "toggle_pin" => self.toggle_pin_active_tab(),
             "show_help" => self.hotkeys_help = true,
             "language_picker" => {
@@ -2734,11 +3110,16 @@ impl Workspace {
                     .path
                     .as_deref()
                     .is_some_and(languages::is_first_wave_path);
-                self.tip = Some(format!(
-                    "LSP v1: {} | current: {}",
-                    languages::FIRST_WAVE_EXTENSIONS.join(", "),
-                    if cur { "yes" } else { "no" }
-                ));
+                self.tip = Some(
+                    texts(self.language)
+                        .tip_lsp_wave_fmt
+                        .replacen("{}", &languages::FIRST_WAVE_EXTENSIONS.join(", "), 1)
+                        .replacen(
+                            "{}",
+                            if cur { texts(self.language).yes } else { texts(self.language).no },
+                            1,
+                        ),
+                );
             }
             "in_file_find" => {
                 let w = self.word_under_cursor();
@@ -2752,25 +3133,387 @@ impl Workspace {
                     sel: 0,
                 });
             }
-            "git_status" => self.open_git_output("Git: status", &["status", "-sb"]),
-            "git_diff_unstaged" => self.open_git_output("Git: diff (unstaged)", &["diff", "--stat"]),
-            "git_diff_staged" => self.open_git_output("Git: diff (staged)", &["diff", "--cached", "--stat"]),
+            "git_status" => self.open_git_output(texts(self.language).git_title_status, &["status", "-sb"]),
+            "git_diff_unstaged" => self.open_git_output(texts(self.language).git_title_diff_unstaged, &["diff", "--stat"]),
+            "git_diff_staged" => self.open_git_output(texts(self.language).git_title_diff_staged, &["diff", "--cached", "--stat"]),
             "git_log" => self.open_git_output(
-                "Git: log",
+                texts(self.language).git_title_log,
                 &["log", "-n", "24", "--oneline", "--decorate"],
             ),
+            "llm_health" => self.run_llm_health_check(),
+            "llm_explain_current_line" => self.run_llm_explain_current_line(),
+            "agent_run_loop" => self.run_agent_loop_mvp(),
             _ => {}
         }
         self.persist_settings();
     }
 
-    fn run_rust_check_current_file(&mut self) {
-        let Some(path) = self.doc().path.as_ref().cloned() else {
-            self.tip = Some("Open a file first".to_string());
+    fn run_llm_health_check(&mut self) {
+        let s = settings::load_settings();
+        if !s.llm_enabled {
+            self.tip = Some(texts(self.language).llm_disabled.to_string());
+            self.llm_status = "disabled".to_string();
+            return;
+        }
+
+        self.llm_status = "checking".to_string();
+        let client = TceLlmClient::from_settings(&s);
+        match client.check_health() {
+            Ok(h) => {
+                self.llm_health_checked = h.ok;
+                self.llm_status = if h.ok {
+                    "ready".to_string()
+                } else {
+                    "error".to_string()
+                };
+                self.tip = Some(if h.ok {
+                    texts(self.language).llm_service_ok.to_string()
+                } else {
+                    texts(self.language).llm_service_not_ok.to_string()
+                });
+            }
+            Err(e) => {
+                self.llm_status = "error".to_string();
+                self.tip = Some(e.user_message());
+            }
+        }
+    }
+
+    fn run_llm_explain_current_line(&mut self) {
+        let s = settings::load_settings();
+        if !s.llm_enabled {
+            self.tip = Some(texts(self.language).llm_disabled.to_string());
+            return;
+        }
+
+        if !self.ensure_llm_health(&s) {
+            return;
+        }
+
+        let row = self.doc().row;
+        let line = self
+            .doc()
+            .buffer
+            .lines()
+            .get(row)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        if line.is_empty() {
+            self.tip = Some(texts(self.language).llm_current_line_empty.to_string());
+            return;
+        }
+
+        let user_prompt = format!("Объясни строку кода:\n{line}");
+        self.run_llm_prompt(user_prompt);
+    }
+
+    fn run_llm_prompt(&mut self, user_prompt: String) {
+        let s = settings::load_settings();
+        if !s.llm_enabled {
+            self.tip = Some(texts(self.language).llm_disabled.to_string());
+            self.llm_status = "disabled".to_string();
+            return;
+        }
+
+        if self.llm_inflight.is_some() {
+            self.tip = Some(texts(self.language).llm_busy.to_string());
+            return;
+        }
+
+        if !self.ensure_llm_health(&s) {
+            return;
+        }
+
+        self.push_llm_history("user", user_prompt.clone());
+        self.push_llm_history("assistant", String::new());
+        self.llm_status = "generating".to_string();
+        self.tip = Some(texts(self.language).llm_running.to_string());
+
+        let req = LlmChatRequest {
+            stream: true,
+            system: s.llm_system_prompt.clone(),
+            messages: vec![LlmChatMessage {
+                role: "user".to_string(),
+                content: user_prompt,
+            }],
+            editor: self.build_llm_editor_context(&s),
+            generate: Some(LlmGenerateParams {
+                max_tokens: s.llm_generate_max_tokens,
+                temperature: s.llm_generate_temperature,
+            }),
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = Arc::clone(&cancel);
+        let (tx, rx) = mpsc::channel::<LlmTaskResult>();
+        std::thread::spawn(move || {
+            let client = TceLlmClient::from_settings(&s);
+            let tx_delta = tx.clone();
+            let result = client.send_chat_streaming(&req, Arc::clone(&cancel_bg), move |delta| {
+                let _ = tx_delta.send(LlmTaskResult::Delta(delta.to_string()));
+            });
+            if cancel_bg.load(Ordering::Relaxed) {
+                return;
+            }
+            let _ = match result {
+                Ok(resp) => tx.send(LlmTaskResult::Ok(resp.message.content)),
+                Err(e) => tx.send(LlmTaskResult::Err(e.user_message())),
+            };
+        });
+        self.llm_inflight = Some(LlmInFlight { cancel, rx });
+    }
+
+    fn poll_llm_inflight(&mut self) {
+        let Some(inflight) = &self.llm_inflight else {
             return;
         };
+        match inflight.rx.try_recv() {
+            Ok(LlmTaskResult::Delta(chunk)) => {
+                if let Some(last) = self.llm_history.last_mut() {
+                    if last.role == "assistant" {
+                        last.content.push_str(&chunk);
+                    }
+                }
+                self.tip = Some(format!("LLM: {}", truncate_str(chunk.trim(), 100)));
+            }
+            Ok(LlmTaskResult::Ok(content)) => {
+                self.llm_inflight = None;
+                if let Some(last) = self.llm_history.last_mut() {
+                    if last.role == "assistant" {
+                        last.content = content.clone();
+                    } else {
+                        self.push_llm_history("assistant", content.clone());
+                    }
+                } else {
+                    self.push_llm_history("assistant", content.clone());
+                }
+                self.llm_status = "ready".to_string();
+                self.tip = Some(format!("LLM: {}", truncate_str(content.trim(), 160)));
+            }
+            Ok(LlmTaskResult::Err(message)) => {
+                self.llm_inflight = None;
+                self.llm_status = "error".to_string();
+                self.tip = Some(message);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.llm_inflight = None;
+                self.llm_status = "error".to_string();
+                self.tip = Some(texts(self.language).llm_stream_failed.to_string());
+            }
+        }
+    }
+
+    fn cancel_llm_inflight(&mut self) {
+        if let Some(inflight) = self.llm_inflight.take() {
+            inflight.cancel.store(true, Ordering::Relaxed);
+            self.llm_status = "cancelled".to_string();
+            self.tip = Some(texts(self.language).llm_cancelled.to_string());
+        }
+    }
+
+    fn run_agent_loop_mvp(&mut self) {
+        let s = settings::load_settings();
+        if !s.llm_enabled {
+            self.tip = Some(texts(self.language).llm_disabled.to_string());
+            self.llm_status = "disabled".to_string();
+            return;
+        }
+        if self.llm_inflight.is_some() || self.agent_inflight.is_some() {
+            self.tip = Some(texts(self.language).tip_agent_busy.to_string());
+            return;
+        }
+        if !self.ensure_llm_health(&s) {
+            return;
+        }
+
+        let goal = if let Some(path) = self.doc().path.as_ref() {
+            format!(
+                "Проанализируй файл `{}` и предложи следующие действия через инструменты.",
+                path.to_string_lossy()
+            )
+        } else {
+            "Проанализируй текущий контекст проекта и предложи следующий шаг".to_string()
+        };
+        let session_id = format!("tce-session-{}", std::process::id());
+        let root = self.project_root.clone();
+        let allow_unsafe_tools = self.agent_allow_unsafe_tools;
+        let (tx, rx) = mpsc::channel::<AgentTaskResult>();
+
+        self.llm_status = "agent-running".to_string();
+        self.tip = Some(texts(self.language).agent_running.to_string());
+        self.push_llm_history("user", format!("[agent] {goal}"));
+
+        std::thread::spawn(move || {
+            let sandbox = match AgentSandbox::new(root, 64 * 1024) {
+                Ok(sandbox) => sandbox,
+                Err(e) => {
+                    let _ = tx.send(AgentTaskResult::Err(e.to_string()));
+                    return;
+                }
+            };
+            let tools = AgentToolExecutor::new(sandbox, allow_unsafe_tools);
+            let client = TceLlmClient::from_settings(&s);
+            let orchestrator = AgentOrchestrator::new(&client, &tools, 6);
+            let _ = match orchestrator.run(&session_id, &goal) {
+                Ok(result) => tx.send(AgentTaskResult::Ok {
+                    summary: result.final_summary,
+                    steps: result.steps,
+                    finished: result.finished,
+                    events: result.events,
+                }),
+                Err(err) => tx.send(AgentTaskResult::Err(err)),
+            };
+        });
+
+        self.agent_inflight = Some(AgentInFlight { rx });
+    }
+
+    fn poll_agent_inflight(&mut self) {
+        let Some(inflight) = &self.agent_inflight else {
+            return;
+        };
+        match inflight.rx.try_recv() {
+            Ok(AgentTaskResult::Ok {
+                summary,
+                steps,
+                finished,
+                events,
+            }) => {
+                self.agent_inflight = None;
+                self.llm_status = if finished {
+                    "agent-ready".to_string()
+                } else {
+                    "agent-limit".to_string()
+                };
+                let msg = texts(self.language)
+                    .agent_steps_summary_fmt
+                    .replacen("{}", &steps.to_string(), 1)
+                    .replacen("{}", &finished.to_string(), 1)
+                    .replacen("{}", &summary, 1);
+                self.push_llm_history("assistant", msg.clone());
+                self.agent_events.extend(events);
+                if self.agent_events.len() > 500 {
+                    let drain = self.agent_events.len() - 500;
+                    self.agent_events.drain(0..drain);
+                }
+                self.tip = Some(msg);
+            }
+            Ok(AgentTaskResult::Err(message)) => {
+                self.agent_inflight = None;
+                self.llm_status = "agent-error".to_string();
+                self.push_llm_history(
+                    "assistant",
+                    format!("{}{}", texts(self.language).agent_error_prefix, message),
+                );
+                self.tip = Some(message);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.agent_inflight = None;
+                self.llm_status = "agent-error".to_string();
+                self.tip = Some(texts(self.language).agent_stream_failed.to_string());
+            }
+        }
+    }
+
+    fn push_llm_history(&mut self, role: &str, content: String) {
+        self.llm_history.push(LlmHistoryEntry {
+            role: role.to_string(),
+            content,
+        });
+        if self.llm_history.len() > 200 {
+            let drain = self.llm_history.len() - 200;
+            self.llm_history.drain(0..drain);
+        }
+    }
+
+    fn insert_last_llm_answer(&mut self) {
+        let last = self
+            .llm_history
+            .iter()
+            .rev()
+            .find(|entry| entry.role == "assistant" && !entry.content.trim().is_empty())
+            .map(|entry| entry.content.clone());
+
+        let Some(answer) = last else {
+            self.tip = Some(texts(self.language).no_assistant_answer.to_string());
+            return;
+        };
+
+        self.doc_mut().insert_text(&answer);
+        self.tip = Some(texts(self.language).tip_assistant_answer_inserted.to_string());
+    }
+
+    fn ensure_llm_health(&mut self, s: &settings::AppSettings) -> bool {
+        if self.llm_health_checked {
+            return true;
+        }
+
+        let client = TceLlmClient::from_settings(s);
+        match client.check_health() {
+            Ok(h) if h.ok => {
+                self.llm_health_checked = true;
+                self.llm_status = "ready".to_string();
+                true
+            }
+            Ok(_) => {
+                self.tip = Some(texts(self.language).llm_service_not_ok.to_string());
+                self.llm_status = "error".to_string();
+                false
+            }
+            Err(e) => {
+                self.tip = Some(e.user_message());
+                self.llm_status = "error".to_string();
+                false
+            }
+        }
+    }
+
+    fn build_llm_editor_context(&self, s: &settings::AppSettings) -> Option<LlmEditorContext> {
+        if !s.llm_attach_editor {
+            return None;
+        }
+
+        let doc = self.doc();
+        let path = doc.path.as_ref()?;
+        let path_text = path.to_string_lossy().to_string();
+        let language = path
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        let lines = doc.buffer.lines();
+        if lines.is_empty() {
+            return None;
+        }
+
+        let around = s.llm_snippet_lines / 2;
+        let start = doc.row.saturating_sub(around);
+        let end = (doc.row + around + 1).min(lines.len());
+        let mut snippet = lines[start..end].join("\n");
+        if snippet.len() > s.llm_snippet_max_bytes {
+            snippet.truncate(s.llm_snippet_max_bytes);
+        }
+
+        Some(LlmEditorContext {
+            path: path_text,
+            language,
+            snippet,
+            cursor_line: doc.row,
+            cursor_column: doc.col,
+        })
+    }
+
+    fn run_rust_check_current_file(&mut self) {
+        let Some(path) = self.doc().path.as_ref().cloned() else {
+            self.tip = Some(texts(self.language).tip_open_file_first.to_string());
+            return;
+        };
+
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            self.tip = Some("Rust diagnostics are available for .rs files".to_string());
+            self.tip = Some(texts(self.language).tip_rust_diagnostics_rs_only.to_string());
             return;
         }
         let output = Command::new("rustc")
@@ -2780,11 +3523,12 @@ impl Workspace {
             .output();
 
         let Ok(output) = output else {
-            self.tip = Some("Failed to run rustc".to_string());
+            self.tip = Some(texts(self.language).tip_failed_run_rustc.to_string());
             return;
         };
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut items = Vec::<DiagnosticItem>::new();
+
         for line in stderr.lines() {
             let mut parts = line.splitn(4, ':');
             let p0 = parts.next().unwrap_or_default().trim();
@@ -2794,17 +3538,20 @@ impl Workspace {
             if p0.is_empty() || p1.is_empty() || p2.is_empty() || p3.is_empty() {
                 continue;
             }
+
             let line_num = p1.parse::<usize>().ok().unwrap_or(1).saturating_sub(1);
             let col_num = p2.parse::<usize>().ok().unwrap_or(1).saturating_sub(1);
             let diag_path = PathBuf::from(p0);
             if !diag_path.exists() {
                 continue;
             }
+
             let severity = if p3.to_lowercase().contains("warning") {
                 DiagnosticSeverity::Warning
             } else {
                 DiagnosticSeverity::Error
             };
+
             items.push(DiagnosticItem {
                 path: diag_path,
                 row: line_num,
@@ -2815,23 +3562,26 @@ impl Workspace {
         }
 
         if items.is_empty() {
-            self.tip = Some("Rust check: no diagnostics".to_string());
+            self.tip = Some(texts(self.language).tip_rust_check_no_diagnostics.to_string());
             self.diagnostics = None;
             return;
         }
+
         self.diagnostics = Some(DiagnosticsState {
             items,
             sel: 0,
             open: true,
             filter: DiagnosticsFilter::All,
         });
-        self.tip = Some("Rust diagnostics ready".to_string());
+
+        self.tip = Some(texts(self.language).tip_rust_diagnostics_ready.to_string());
     }
 
     fn diagnostics_visible_items(&self) -> Vec<DiagnosticItem> {
         let Some(state) = self.diagnostics.as_ref() else {
             return Vec::new();
         };
+
         state
             .items
             .iter()
@@ -2848,6 +3598,7 @@ impl Workspace {
         if self.diagnostics.is_none() {
             return;
         }
+
         let mut visible_len = self.diagnostics_visible_items().len();
         match key {
             Key::Esc => {
@@ -2884,9 +3635,10 @@ impl Workspace {
                     };
                     state.sel = 0;
                 }
+
                 visible_len = self.diagnostics_visible_items().len();
                 if visible_len == 0 {
-                    self.tip = Some("No diagnostics for this filter".to_string());
+                    self.tip = Some(texts(self.language).tip_no_diagnostics_for_filter.to_string());
                 }
             }
             Key::Enter => {
@@ -2894,6 +3646,7 @@ impl Workspace {
                 if items.is_empty() {
                     return;
                 }
+
                 let idx = self
                     .diagnostics
                     .as_ref()
@@ -2908,11 +3661,7 @@ impl Workspace {
     }
 
     fn open_git_output(&mut self, title: &str, args: &[&str]) {
-        let out = match Command::new("git")
-            .current_dir(&self.project_root)
-            .args(args)
-            .output()
-        {
+        let out = match Command::new("git").current_dir(&self.project_root).args(args).output(){
             Ok(o) => o,
             Err(e) => {
                 self.tip = Some(format!("{}: {e}", texts(self.language).error_prefix));
@@ -2924,15 +3673,18 @@ impl Workspace {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+
         if combined.is_empty() {
-            combined.push_str("(empty output)");
+            combined.push_str(texts(self.language).tip_empty_output);
         }
+
         let lines: Vec<String> = combined.lines().map(|s| s.to_string()).collect();
         let title = if out.status.success() {
             title.to_string()
         } else {
             format!("{} (git exit {})", title, out.status)
         };
+
         self.git_view = Some(GitViewState {
             title,
             lines,
@@ -3010,6 +3762,145 @@ impl Workspace {
         }
     }
 
+    fn handle_llm_history_view_key(&mut self, key: Key) {
+        let Some(state) = self.llm_history_view.as_mut() else {
+            return;
+        };
+
+        let total = self.llm_history.len();
+        let size = winsize_tty().unwrap_or(TermSize { rows: 24, cols: 80 });
+        let rows = size.rows.max(1) as usize;
+        let body_h = rows.saturating_sub(2).max(1);
+
+        match key {
+            Key::Esc => {
+                self.llm_history_view = None;
+            }
+            Key::ArrowUp => {
+                state.cursor = state.cursor.saturating_sub(1);
+                if state.cursor < state.scroll {
+                    state.scroll = state.cursor;
+                }
+            }
+            Key::ArrowDown => {
+                if total > 0 {
+                    state.cursor = (state.cursor + 1).min(total - 1);
+                    let max_scroll = total.saturating_sub(body_h);
+                    if state.cursor >= state.scroll + body_h {
+                        state.scroll = state.cursor + 1 - body_h;
+                    }
+                    if state.scroll > max_scroll {
+                        state.scroll = max_scroll;
+                    }
+                }
+            }
+            Key::PageUp => {
+                let step = body_h.max(1);
+                state.cursor = state.cursor.saturating_sub(step);
+                state.scroll = state.scroll.saturating_sub(step);
+            }
+            Key::PageDown => {
+                let step = body_h.max(1);
+                if total > 0 {
+                    state.cursor = (state.cursor + step).min(total - 1);
+                    let max_scroll = total.saturating_sub(body_h);
+                    state.scroll = (state.scroll + step).min(max_scroll);
+                    if state.cursor < state.scroll {
+                        state.scroll = state.cursor;
+                    }
+                }
+            }
+            Key::Home => {
+                state.cursor = 0;
+                state.scroll = 0;
+            }
+            Key::End => {
+                if total > 0 {
+                    state.cursor = total - 1;
+                }
+                state.scroll = total.saturating_sub(body_h);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_agent_events_view_key(&mut self, key: Key) {
+        let Some(state) = self.agent_events_view.as_mut() else {
+            return;
+        };
+
+        let total = self.agent_events.len();
+        let size = winsize_tty().unwrap_or(TermSize { rows: 24, cols: 80 });
+        let rows = size.rows.max(1) as usize;
+        let body_h = rows.saturating_sub(2).max(1);
+
+        match key {
+            Key::Esc => {
+                self.agent_events_view = None;
+            }
+            Key::ArrowUp => {
+                state.cursor = state.cursor.saturating_sub(1);
+                if state.cursor < state.scroll {
+                    state.scroll = state.cursor;
+                }
+            }
+            Key::ArrowDown => {
+                if total > 0 {
+                    state.cursor = (state.cursor + 1).min(total - 1);
+                    let max_scroll = total.saturating_sub(body_h);
+                    if state.cursor >= state.scroll + body_h {
+                        state.scroll = state.cursor + 1 - body_h;
+                    }
+                    if state.scroll > max_scroll {
+                        state.scroll = max_scroll;
+                    }
+                }
+            }
+            Key::PageUp => {
+                let step = body_h.max(1);
+                state.cursor = state.cursor.saturating_sub(step);
+                state.scroll = state.scroll.saturating_sub(step);
+            }
+            Key::PageDown => {
+                let step = body_h.max(1);
+                if total > 0 {
+                    state.cursor = (state.cursor + step).min(total - 1);
+                    let max_scroll = total.saturating_sub(body_h);
+                    state.scroll = (state.scroll + step).min(max_scroll);
+                    if state.cursor < state.scroll {
+                        state.scroll = state.cursor;
+                    }
+                }
+            }
+            Key::Home => {
+                state.cursor = 0;
+                state.scroll = 0;
+            }
+            Key::End => {
+                if total > 0 {
+                    state.cursor = total - 1;
+                }
+                state.scroll = total.saturating_sub(body_h);
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_agent_unsafe_confirm_key(&mut self, key: Key) {
+        match key {
+            Key::Char('y') | Key::Char('Y') => {
+                self.agent_allow_unsafe_tools = true;
+                self.agent_unsafe_confirm = false;
+                self.tip = Some(texts(self.language).agent_unsafe_enabled.to_string());
+            }
+            Key::Char('n') | Key::Char('N') | Key::Esc => {
+                self.agent_unsafe_confirm = false;
+                self.tip = Some(texts(self.language).agent_unsafe_cancelled.to_string());
+            }
+            _ => {}
+        }
+    }
+
     fn symbol_jump_matches(&self) -> Vec<SymbolItem> {
         let Some(state) = &self.symbol_jump else {
             return Vec::new();
@@ -3020,6 +3911,7 @@ impl Workspace {
             let Ok(content) = fs::read_to_string(&entry.path) else {
                 continue;
             };
+
             for (line_idx, line) in content.lines().enumerate() {
                 if let Some((kind, name)) = extract_symbol_from_line(line) {
                     let key = format!("{kind} {name} {}", entry.path.to_string_lossy()).to_lowercase();
@@ -3055,12 +3947,14 @@ impl Workspace {
             if start_row + i >= rows {
                 break;
             }
+
             let mut line = String::new();
             line.push(' ');
             line.push_str(&format!("[{}] {}", action.shortcut(), action.label()));
             while line.chars().count() < width {
                 line.push(' ');
             }
+
             if i == self.sidebar_menu_sel {
                 out.push_str(&format!(
                     "\x1b[{};{}H\x1b[7m{}\x1b[0m",
@@ -3206,9 +4100,11 @@ impl Workspace {
         let Some(state) = self.project_search.as_ref() else {
             return;
         };
+
         if rows < 2 || cols == 0 {
             return;
         }
+
         let prompt_row = rows;
         let mode = if state.regex_mode { "regex" } else { "text" };
         let marker = if state.edit_replacement { "replace*" } else { "search*" };
@@ -3216,9 +4112,11 @@ impl Workspace {
             "[{mode}] {marker} Search: {} | Replace: {}",
             state.query, state.replacement
         );
+
         if state.confirm_replace_all {
             prompt.push_str(" | Enter: confirm replace all");
         }
+
         prompt.push_str(" | Tab field | Ctrl+O regex | Ctrl+G replace current | Ctrl+R replace all");
         if prompt.chars().count() > cols {
             prompt = prompt
@@ -3226,12 +4124,14 @@ impl Workspace {
                 .skip(prompt.chars().count().saturating_sub(cols))
                 .collect();
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", prompt_row));
         out.push_str(&prompt);
         while prompt.chars().count() < cols {
             out.push(' ');
             prompt.push(' ');
         }
+
         out.push_str("\x1b[0m");
 
         let matches = self.project_search_matches();
@@ -3244,6 +4144,7 @@ impl Workspace {
         } else {
             None
         };
+
         let mut row = rows.saturating_sub(1);
         if let Some(preview_line) = preview {
             if row > 0 {
@@ -3259,6 +4160,7 @@ impl Workspace {
             if row == 0 {
                 break;
             }
+
             let rel = hit
                 .path
                 .strip_prefix(&self.project_root)
@@ -3271,15 +4173,18 @@ impl Workspace {
                 hit.line_idx + 1,
                 truncate_str(&hit.preview, cols.saturating_sub(16))
             );
+
             let mut line = truncate_str(&body, cols);
             while line.chars().count() < cols {
                 line.push(' ');
             }
+
             if i == state.sel {
                 out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, line));
             } else {
                 out.push_str(&format!("\x1b[{};1H{}", row, line));
             }
+
             row = row.saturating_sub(1);
         }
     }
@@ -3288,9 +4193,11 @@ impl Workspace {
         let Some(state) = self.symbol_jump.as_ref() else {
             return;
         };
+
         if rows < 2 || cols == 0 {
             return;
         }
+
         let mut prompt = format!("Symbols: {}", state.query);
         if prompt.chars().count() > cols {
             prompt = prompt
@@ -3298,12 +4205,14 @@ impl Workspace {
                 .skip(prompt.chars().count().saturating_sub(cols))
                 .collect();
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
         out.push_str(&prompt);
         while prompt.chars().count() < cols {
             out.push(' ');
             prompt.push(' ');
         }
+
         out.push_str("\x1b[0m");
 
         let matches = self.symbol_jump_matches();
@@ -3312,6 +4221,7 @@ impl Workspace {
             if row == 0 {
                 break;
             }
+
             let rel = item
                 .path
                 .strip_prefix(&self.project_root)
@@ -3323,11 +4233,13 @@ impl Workspace {
             while line.chars().count() < cols {
                 line.push(' ');
             }
+
             if i == state.sel {
                 out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, line));
             } else {
                 out.push_str(&format!("\x1b[{};1H{}", row, line));
             }
+
             row = row.saturating_sub(1);
         }
     }
@@ -3336,9 +4248,11 @@ impl Workspace {
         let Some(state) = self.go_to_line.as_ref() else {
             return;
         };
+
         if rows == 0 || cols == 0 {
             return;
         }
+
         let mut prompt = format!("Go to line: {}", state.input);
         if prompt.chars().count() > cols {
             prompt = prompt
@@ -3346,12 +4260,41 @@ impl Workspace {
                 .skip(prompt.chars().count().saturating_sub(cols))
                 .collect();
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
         out.push_str(&prompt);
         while prompt.chars().count() < cols {
             out.push(' ');
             prompt.push(' ');
         }
+
+        out.push_str("\x1b[0m");
+    }
+
+    fn render_llm_prompt_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.llm_prompt.as_ref() else {
+            return;
+        };
+
+        if rows == 0 || cols == 0 {
+            return;
+        }
+
+        let mut prompt = format!("{} {}", texts(self.language).llm_ask_prefix, state.input);
+        if prompt.chars().count() > cols {
+            prompt = prompt
+                .chars()
+                .skip(prompt.chars().count().saturating_sub(cols))
+                .collect();
+        }
+
+        out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
+        out.push_str(&prompt);
+        while prompt.chars().count() < cols {
+            out.push(' ');
+            prompt.push(' ');
+        }
+
         out.push_str("\x1b[0m");
     }
 
@@ -3359,19 +4302,23 @@ impl Workspace {
         let Some(state) = self.multi_edit.as_ref() else {
             return;
         };
+
         if rows == 0 || cols == 0 {
             return;
         }
+
         let mut prompt = format!(
             "Multi-edit: '{}' -> '{}' (Enter apply, Esc cancel)",
             state.target, state.replacement
         );
+
         if prompt.chars().count() > cols {
             prompt = prompt
                 .chars()
                 .skip(prompt.chars().count().saturating_sub(cols))
                 .collect();
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
         out.push_str(&prompt);
         while prompt.chars().count() < cols {
@@ -3385,19 +4332,23 @@ impl Workspace {
         let Some(state) = self.sync_edit.as_ref() else {
             return;
         };
+
         if rows == 0 || cols == 0 {
             return;
         }
+
         let mut prompt = format!(
             "Sync-edit {}x: '{}' -> '{}' (Enter apply, Esc cancel)",
             state.occurrences, state.target, state.replacement
         );
+
         if prompt.chars().count() > cols {
             prompt = prompt
                 .chars()
                 .skip(prompt.chars().count().saturating_sub(cols))
                 .collect();
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
         out.push_str(&prompt);
         while prompt.chars().count() < cols {
@@ -3411,9 +4362,11 @@ impl Workspace {
         let Some(state) = self.command_palette.as_ref() else {
             return;
         };
+
         if rows < 2 || cols == 0 {
             return;
         }
+
         let mut prompt = format!("Command: {}", state.query);
         if prompt.chars().count() > cols {
             prompt = prompt
@@ -3421,6 +4374,7 @@ impl Workspace {
                 .skip(prompt.chars().count().saturating_sub(cols))
                 .collect();
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
         out.push_str(&prompt);
         while prompt.chars().count() < cols {
@@ -3430,22 +4384,24 @@ impl Workspace {
         out.push_str("\x1b[0m");
 
         let items = self.command_palette_items();
-        let mut row = rows.saturating_sub(1);
+        let mut row = 1usize;
         for (i, item) in items.iter().enumerate() {
-            if row == 0 {
+            if row >= rows {
                 break;
             }
+
             let mut line = format!(" {}", item.0);
             line = truncate_str(&line, cols);
             while line.chars().count() < cols {
                 line.push(' ');
             }
+
             if i == state.sel {
                 out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, line));
             } else {
                 out.push_str(&format!("\x1b[{};1H{}", row, line));
             }
-            row = row.saturating_sub(1);
+            row = row.saturating_add(1);
         }
     }
 
@@ -3453,9 +4409,11 @@ impl Workspace {
         let Some(state) = self.diagnostics.as_ref() else {
             return;
         };
+
         if rows < 2 || cols == 0 {
             return;
         }
+
         let visible = self.diagnostics_visible_items();
         let filter = match state.filter {
             DiagnosticsFilter::All => "All",
@@ -3468,15 +4426,18 @@ impl Workspace {
             state.items.len(),
             filter
         );
+
         if title.chars().count() > cols {
             title = truncate_str(&title, cols);
         }
+
         out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
         out.push_str(&title);
         while title.chars().count() < cols {
             out.push(' ');
             title.push(' ');
         }
+
         out.push_str("\x1b[0m");
 
         let mut row = rows.saturating_sub(1);
@@ -3484,6 +4445,7 @@ impl Workspace {
             if row == 0 {
                 break;
             }
+
             let rel = d
                 .path
                 .strip_prefix(&self.project_root)
@@ -3501,6 +4463,7 @@ impl Workspace {
                 d.col.saturating_add(1),
                 d.message
             );
+
             line = truncate_str(&line, cols);
             while line.chars().count() < cols {
                 line.push(' ');
@@ -3572,11 +4535,140 @@ impl Workspace {
         }
     }
 
+    fn render_llm_history_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.llm_history_view.as_ref() else {
+            return;
+        };
+
+        if rows < 3 || cols == 0 {
+            return;
+        }
+
+        let hint = "Esc close | arrows PgUp/Dn | Home/End";
+        let hint = truncate_str(hint, cols);
+        out.push_str(&format!("\x1b[1;1H\x1b[90m{hint}\x1b[0m"));
+
+        let body_h = rows.saturating_sub(2).max(1);
+        let last_line = (state.scroll + body_h).min(self.llm_history.len().max(1));
+        let mut title_line = texts(self.language)
+            .llm_history_overlay_title
+            .replacen("{}", &(state.scroll + 1).to_string(), 1)
+            .replacen("{}", &last_line.to_string(), 1)
+            .replacen("{}", &self.llm_history.len().to_string(), 1);
+
+        if title_line.chars().count() > cols {
+            title_line = truncate_str(&title_line, cols);
+        }
+
+        while title_line.chars().count() < cols {
+            title_line.push(' ');
+        }
+
+        out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
+        out.push_str(&title_line);
+        out.push_str("\x1b[0m");
+
+        let mut row = rows.saturating_sub(1);
+        let start = state.scroll;
+        let end = (start + body_h).min(self.llm_history.len());
+        for idx in start..end {
+            if row <= 1 {
+                break;
+            }
+
+            let item = &self.llm_history[idx];
+            let text = format!("[{}] {}", item.role, item.content);
+            let mut clipped = truncate_str(&text, cols);
+            while clipped.chars().count() < cols {
+                clipped.push(' ');
+            }
+
+            if idx == state.cursor {
+                out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, clipped));
+            } else {
+                out.push_str(&format!("\x1b[{};1H{}", row, clipped));
+            }
+
+            row = row.saturating_sub(1);
+        }
+    }
+
+    fn render_agent_events_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.agent_events_view.as_ref() else {
+            return;
+        };
+
+        if rows < 3 || cols == 0 {
+            return;
+        }
+
+        let hint = "Esc close | arrows PgUp/Dn | Home/End";
+        let hint = truncate_str(hint, cols);
+        out.push_str(&format!("\x1b[1;1H\x1b[90m{hint}\x1b[0m"));
+
+        let body_h = rows.saturating_sub(2).max(1);
+        let last_line = (state.scroll + body_h).min(self.agent_events.len().max(1));
+        let mut title_line = texts(self.language)
+            .agent_events_overlay_title
+            .replacen("{}", &(state.scroll + 1).to_string(), 1)
+            .replacen("{}", &last_line.to_string(), 1)
+            .replacen("{}", &self.agent_events.len().to_string(), 1);
+
+        if title_line.chars().count() > cols {
+            title_line = truncate_str(&title_line, cols);
+        }
+
+        while title_line.chars().count() < cols {
+            title_line.push(' ');
+        }
+
+        out.push_str(&format!("\x1b[{};1H\x1b[7m", rows));
+        out.push_str(&title_line);
+        out.push_str("\x1b[0m");
+
+        let mut row = rows.saturating_sub(1);
+        let start = state.scroll;
+        let end = (start + body_h).min(self.agent_events.len());
+        for idx in start..end {
+            if row <= 1 {
+                break;
+            }
+
+            let mut clipped = truncate_str(&self.agent_events[idx], cols);
+            while clipped.chars().count() < cols {
+                clipped.push(' ');
+            }
+
+            if idx == state.cursor {
+                out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, clipped));
+            } else {
+                out.push_str(&format!("\x1b[{};1H{}", row, clipped));
+            }
+            row = row.saturating_sub(1);
+        }
+    }
+
+    fn render_agent_unsafe_confirm_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        if rows < 3 || cols == 0 {
+            return;
+        }
+
+        let msg = texts(self.language).agent_unsafe_confirm_overlay;
+        let mut line = truncate_str(msg, cols);
+        while line.chars().count() < cols {
+            line.push(' ');
+        }
+
+        let row = (rows / 2).max(1);
+        out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, line));
+    }
+
     fn render_search_replace_preview(&self, hit: &SearchMatch) -> Option<String> {
         let state = self.project_search.as_ref()?;
         if state.query.is_empty() || state.replacement.is_empty() {
             return None;
         }
+
         let content = fs::read_to_string(&hit.path).ok()?;
         let line = content.lines().nth(hit.line_idx)?;
         let replaced = if state.regex_mode {
@@ -3610,9 +4702,11 @@ impl Workspace {
                 if doc.pinned {
                     name = format!("P:{name}");
                 }
+
                 if doc.dirty {
                     name.push('*');
                 }
+
                 let label = format!(" {}  x ", truncate_str(&name, 18));
                 if idx == self.active_doc {
                     if self.focus == Focus::Tabs && idx == self.tab_sel {
@@ -3672,6 +4766,15 @@ impl Workspace {
             Focus::Sidebar => Focus::Tabs,
             Focus::Tabs => Focus::Editor,
             Focus::Editor => {
+                if self.right_panel_visible {
+                    Focus::RightPanel
+                } else if self.sidebar_visible {
+                    Focus::Sidebar
+                } else {
+                    Focus::Tabs
+                }
+            }
+            Focus::RightPanel => {
                 if self.sidebar_visible {
                     Focus::Sidebar
                 } else {
@@ -3683,16 +4786,46 @@ impl Workspace {
 
     fn focus_prev(&mut self) {
         self.focus = match self.focus {
-            Focus::Sidebar => Focus::Editor,
+            Focus::Sidebar => {
+                if self.right_panel_visible {
+                    Focus::RightPanel
+                } else {
+                    Focus::Editor
+                }
+            }
             Focus::Tabs => {
                 if self.sidebar_visible {
                     Focus::Sidebar
+                } else if self.right_panel_visible {
+                    Focus::RightPanel
                 } else {
                     Focus::Editor
                 }
             }
             Focus::Editor => Focus::Tabs,
+            Focus::RightPanel => Focus::Editor,
         };
+    }
+
+    fn handle_right_panel_key(&mut self, key: Key) {
+        match key {
+            Key::Backspace => {
+                self.right_panel_input.pop();
+            }
+            Key::Char(ch) => {
+                self.right_panel_input.push(ch);
+            }
+            Key::Enter => {
+                let prompt = self.right_panel_input.trim().to_string();
+                if prompt.is_empty() {
+                    self.tip = Some(texts(self.language).llm_prompt_empty.to_string());
+                    return;
+                }
+                self.right_panel_input.clear();
+                self.run_llm_prompt(prompt);
+            }
+            _ => {}
+        }
     }
 
     fn render_language_picker(&self) -> io::Result<()> {
@@ -3792,7 +4925,7 @@ fn rows_to_u32(row: usize) -> u32 {
     row.min(u32::MAX as usize) as u32
 }
 
-/// `git status -sb` lines: `XY PATH` (two status chars, space, path)
+/// Строки `git status -sb`: `XY PATH` (два status-символа, пробел, путь)
 fn path_from_git_short_status_line(project_root: &Path, line: &str) -> Option<PathBuf> {
     let t = line.trim_end();
     if t.starts_with("## ") || t.len() < 4 {
@@ -3902,4 +5035,46 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
         let t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{t}…")
     }
+}
+
+fn pad_ansi_to_width(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let visible = visible_char_count(s);
+    if visible >= width {
+        return s.to_string();
+    }
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(width - visible));
+    out
+}
+
+fn visible_char_count(s: &str) -> usize {
+    let mut count = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&b) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        if let Some(ch) = s[i..].chars().next() {
+            i += ch.len_utf8();
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }

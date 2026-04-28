@@ -1,11 +1,11 @@
-//! Unix TTY: raw mode, window size, restore on drop
+//! Unix TTY: raw-режим, размер окна, восстановление при drop
 #![cfg(unix)]
 
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::unix::io::AsRawFd;
 
-/// Rows and columns of the terminal window (character cells)
+/// Строки и колонки окна терминала (символьные ячейки)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TermSize {
     pub rows: u16,
@@ -30,7 +30,7 @@ fn winsize_fd(fd: std::os::unix::io::RawFd) -> io::Result<TermSize> {
     }
 }
 
-/// Restores cooked mode when dropped (including on panic unwind)
+/// Восстанавливает обычный режим терминала при drop (включая unwind после panic)
 pub struct RawMode {
     fd: std::os::unix::io::RawFd,
     saved: libc::termios,
@@ -47,11 +47,7 @@ impl RawMode {
 
             let saved = saved.assume_init();
             let mut raw = saved;
-            raw.c_iflag &= !(libc::BRKINT
-                | libc::ICRNL
-                | libc::INPCK
-                | libc::ISTRIP
-                | libc::IXON);
+            raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
             raw.c_oflag &= !libc::OPOST;
             raw.c_cflag |= libc::CS8;
             raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
@@ -73,7 +69,7 @@ impl Drop for RawMode {
     }
 }
 
-/// Read up to `buf.len()` bytes within `timeout_ms`, non-blocking after poll.
+/// Читает до `buf.len()` байт за `timeout_ms`; после poll чтение неблокирующее
 pub fn read_timeout(fd: std::os::unix::io::RawFd, buf: &mut [u8], timeout_ms: i32) -> io::Result<usize> {
     unsafe {
         let mut pfd = libc::pollfd {

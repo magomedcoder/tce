@@ -1,4 +1,10 @@
 #[cfg(unix)]
+mod agent_sandbox;
+#[cfg(unix)]
+mod agent_tools;
+#[cfg(unix)]
+mod agent_orchestrator;
+#[cfg(unix)]
 mod app;
 #[cfg(unix)]
 mod buffer;
@@ -18,6 +24,8 @@ mod session;
 mod settings;
 #[cfg(unix)]
 mod terminal;
+#[cfg(unix)]
+mod llm_api;
 #[cfg(unix)]
 mod tree;
 #[cfg(unix)]

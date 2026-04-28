@@ -33,6 +33,7 @@ pub enum Key {
     CtrlB,
     CtrlL,
     CtrlJ,
+    CtrlH,
     CtrlK,
     CtrlN,
     CtrlO,
@@ -41,9 +42,9 @@ pub enum Key {
     CtrlP,
     CtrlX,
     CtrlZ,
-    /// Ctrl+\ (0x1c) - find in current buffer (project search stays on Ctrl+F)
+    /// Ctrl+\ (0x1c) - поиск в текущем буфере (поиск по проекту остаётся на Ctrl+F)
     CtrlBackslash,
-    /// CSI `1;5D` / SS3 style - terminal sends for Ctrl+Left (xterm)
+    /// Стиль CSI `1;5D` / SS3 - терминал отправляет его для Ctrl+Left (xterm)
     CtrlArrowLeft,
     CtrlArrowRight,
     CtrlArrowUp,
@@ -61,11 +62,12 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         return parse_escape(stdin_fd);
     }
 
-    if byte == 127 || byte == 8 {
+    if byte == 127 {
         return Ok(Some(Key::Backspace));
     }
 
-    if byte == b'\r' || byte == b'\n' {
+    // Enter обрабатываем по CR; LF (0x0a) оставляем для Ctrl+J.
+    if byte == b'\r' {
         return Ok(Some(Key::Enter));
     }
 
@@ -128,6 +130,10 @@ pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
 
         if byte == 12 {
             return Ok(Some(Key::CtrlL));
+        }
+
+        if byte == 8 {
+            return Ok(Some(Key::CtrlH));
         }
 
         if byte == 10 {
@@ -225,7 +231,7 @@ fn utf8_char_len(b: u8) -> usize {
 fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     let mut seq = Vec::<u8>::new();
     let mut scratch = [0u8; 64];
-    // First byte after ESC can arrive much later in some terminals/tmux setups
+    // Первый байт после ESC в некоторых терминалах/tmux может прийти заметно позже
     let mut first_wait = true;
     for _ in 0..6 {
         let timeout_ms = if first_wait { 700 } else { 80 };
@@ -245,7 +251,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         return Ok(Some(Key::Esc));
     }
 
-    // Some terminals can prepend an extra ESC byte
+    // Некоторые терминалы могут добавлять лишний байт ESC в начале
     while seq.first() == Some(&0x1b) {
         seq.remove(0);
     }
@@ -275,7 +281,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             _ => return Ok(None),
         }));
     } else if seq[0] == b'O' {
-        // Incomplete SS3 sequence: ignore this key
+        // Неполная SS3-последовательность: игнорируем эту клавишу
         return Ok(None);
     }
 
@@ -285,7 +291,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
 
     let body = &seq[1..];
     if body.is_empty() {
-        // Incomplete CSI sequence (often from arrows split across reads): ignore
+        // Неполная CSI-последовательность (часто при разбиении стрелок на несколько чтений): игнорируем
         return Ok(None);
     }
 
@@ -307,7 +313,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         _ => {}
     }
 
-    // Plain CSI arrows (no `;` params), e.g. ESC [ A - not ESC [ 1 ; 5 D
+    // Обычные CSI-стрелки (без параметров `;`), например ESC [ A, а не ESC [ 1 ; 5 D
     if !body.contains(&b';') {
         if let Some(last) = body.last().copied() {
             match last {
@@ -337,7 +343,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     Ok(None)
 }
 
-/// `ESC [ 1 ; 5 D` style (xterm): last numeric parameter before final byte is the modifier (`5` = Ctrl)
+/// Стиль `ESC [ 1 ; 5 D` (xterm): последний числовой параметр перед финальным байтом — это модификатор (`5` = Ctrl)
 fn parse_csi_modified_arrow(body: &[u8]) -> Option<Key> {
     if body.len() < 3 {
         return None;

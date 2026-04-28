@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use crate::keys::Key;
 use crate::localization::{texts, Language};
 use crate::recents;
+use crate::settings;
 use crate::terminal::{winsize_tty, TermSize};
 
 pub enum WelcomeAction {
@@ -39,14 +40,15 @@ pub struct Welcome {
 
 impl Welcome {
     pub fn new() -> Self {
+        let app_settings = settings::load_settings();
         let browse_dir = home_dir();
         let browse_items = build_folder_items(&browse_dir);
         Self {
             recents: recents::load(),
             selected: 0,
-            language: Language::En,
+            language: app_settings.language,
             language_picker: false,
-            language_sel: 0,
+            language_sel: if app_settings.language == Language::En { 0 } else { 1 },
             hotkeys_help: false,
             folder_browser: false,
             path_input: None,
@@ -141,6 +143,9 @@ impl Welcome {
                         Language::Ru
                     };
                     self.language_picker = false;
+                    let mut s = settings::load_settings();
+                    s.language = self.language;
+                    let _ = settings::save_settings(&s);
                 }
                 Key::CtrlL => {
                     self.language_picker = false;
@@ -153,7 +158,7 @@ impl Welcome {
 
         if self.hotkeys_help {
             match key {
-                Key::CtrlK => {
+                Key::CtrlH => {
                     self.hotkeys_help = false;
                 }
                 Key::CtrlQ => return Ok(WelcomeAction::Quit),
@@ -215,7 +220,7 @@ impl Welcome {
                             self.path_suggestions.clear();
                             self.path_suggestion_sel = 0;
                         }
-                        Key::CtrlN | Key::CtrlQ | Key::CtrlL | Key::CtrlK => {
+                        Key::CtrlN | Key::CtrlQ | Key::CtrlL | Key::CtrlH => {
                             self.path_input = Some(buf);
                         }
                         Key::Char(ch) => {
@@ -298,7 +303,7 @@ impl Welcome {
                     self.language_picker = true;
                     self.language_sel = if self.language == Language::En { 0 } else { 1 };
                 }
-                Key::CtrlK => {
+                Key::CtrlH => {
                     self.hotkeys_help = true;
                 }
                 Key::Char('p') | Key::Char('P') | Key::Char('/') => {
@@ -316,7 +321,7 @@ impl Welcome {
                 self.language_picker = true;
                 self.language_sel = if self.language == Language::En { 0 } else { 1 };
             }
-            Key::CtrlK => {
+            Key::CtrlH => {
                 self.hotkeys_help = true;
             }
             Key::CtrlN | Key::Char('n') | Key::Char('N') => {
@@ -411,6 +416,9 @@ impl Welcome {
             tx.help_k5.to_string(),
             tx.help_k6.to_string(),
             tx.help_k7.to_string(),
+            tx.help_k8.to_string(),
+            tx.help_k9.to_string(),
+            tx.help_k10.to_string(),
             String::new(),
             tx.help_hint.to_string(),
         ];

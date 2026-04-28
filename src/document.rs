@@ -14,6 +14,15 @@ struct Snapshot {
     scroll_row: usize,
     hscroll: usize,
     dirty: bool,
+    selection: Option<SelectionRange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectionRange {
+    pub start_row: usize,
+    pub start_col: usize,
+    pub end_row: usize,
+    pub end_col: usize,
 }
 
 pub struct Document {
@@ -26,6 +35,7 @@ pub struct Document {
     pub dirty: bool,
     pub pinned: bool,
     pub force_quit_pending: bool,
+    selection: Option<SelectionRange>,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
 }
@@ -42,6 +52,7 @@ impl Document {
             dirty: false,
             pinned: false,
             force_quit_pending: false,
+            selection: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -59,6 +70,7 @@ impl Document {
             dirty: false,
             pinned: false,
             force_quit_pending: false,
+            selection: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         })
@@ -72,6 +84,7 @@ impl Document {
             scroll_row: self.scroll_row,
             hscroll: self.hscroll,
             dirty: self.dirty,
+            selection: self.selection.clone(),
         }
     }
 
@@ -82,6 +95,7 @@ impl Document {
         self.scroll_row = snap.scroll_row;
         self.hscroll = snap.hscroll;
         self.dirty = snap.dirty;
+        self.selection = snap.selection;
         self.clamp_cursor();
     }
 
@@ -92,10 +106,12 @@ impl Document {
                 return;
             }
         }
+
         self.undo_stack.push(snap);
         if self.undo_stack.len() > 256 {
             let _ = self.undo_stack.remove(0);
         }
+
         self.redo_stack.clear();
     }
 
@@ -103,6 +119,7 @@ impl Document {
         let Some(prev) = self.undo_stack.pop() else {
             return;
         };
+
         self.redo_stack.push(self.snapshot());
         self.restore_from_snapshot(prev);
     }
@@ -111,6 +128,7 @@ impl Document {
         let Some(next) = self.redo_stack.pop() else {
             return;
         };
+
         self.undo_stack.push(self.snapshot());
         self.restore_from_snapshot(next);
     }
@@ -158,7 +176,7 @@ impl Document {
         }
     }
 
-    /// One line of text for the editor viewport (`max_chars` wide)
+    /// Одна строка текста для окна редактора (ширина `max_chars`)
     pub fn editor_line_display(&self, line_idx: usize, max_chars: usize) -> String {
         self.buffer
             .lines()
@@ -178,7 +196,82 @@ impl Document {
             .unwrap_or_else(|| "[new]".to_string())
     }
 
-    /// `true` = quit application
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        if self.replace_selection_with_text(text) {
+            return;
+        }
+
+        self.push_undo_snapshot();
+        for ch in text.chars() {
+            let (r, c) = self.buffer.insert_char(self.row, self.col, ch);
+            self.row = r;
+            self.col = c;
+        }
+
+        self.dirty = true;
+        self.clamp_cursor();
+    }
+
+    pub fn set_selection(
+        &mut self,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+    ) {
+        self.selection = Some(normalize_selection(
+            start_row, start_col, end_row, end_col,
+        ));
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    fn replace_selection_with_text(&mut self, text: &str) -> bool {
+        let Some(sel) = self.selection.clone() else {
+            return false;
+        };
+
+        // Работаем через линейное представление, чтобы корректно заменить диапазон в том числе на границах строк.
+        let content = self.buffer.to_file_string();
+        let Some(start_off) = position_to_offset(&content, sel.start_row, sel.start_col) else {
+            self.selection = None;
+            return false;
+        };
+        let Some(end_off) = position_to_offset(&content, sel.end_row, sel.end_col) else {
+            self.selection = None;
+            return false;
+        };
+        if start_off > end_off {
+            self.selection = None;
+            return false;
+        }
+
+        // Замена выделения должна быть одной undo-операцией
+        self.push_undo_snapshot();
+        let mut next = String::with_capacity(content.len() + text.len());
+        next.push_str(&content[..start_off]);
+        next.push_str(text);
+        next.push_str(&content[end_off..]);
+
+        self.buffer = Buffer::from_file(&next);
+
+        // Возвращаем курсор в конец вставленного текста
+        let (row, col) = offset_to_position(&next, start_off + text.chars().count());
+        self.row = row;
+        self.col = col;
+        self.clear_selection();
+        self.dirty = true;
+        self.clamp_cursor();
+        true
+    }
+
+    /// `true` = завершить приложение
     pub fn handle_key(&mut self, key: Key) -> io::Result<bool> {
         match key {
             Key::CtrlQ => {
@@ -186,6 +279,7 @@ impl Document {
                     self.force_quit_pending = true;
                     return Ok(false);
                 }
+
                 return Ok(true);
             }
             Key::CtrlS => {
@@ -287,6 +381,7 @@ impl Document {
             | Key::CtrlR
             | Key::CtrlL
             | Key::CtrlJ
+            | Key::CtrlH
             | Key::CtrlK
             | Key::CtrlN
             | Key::CtrlO
@@ -306,7 +401,85 @@ impl Document {
     }
 }
 
+fn normalize_selection(
+    start_row: usize,
+    start_col: usize,
+    end_row: usize,
+    end_col: usize,
+) -> SelectionRange {
+    if (start_row, start_col) <= (end_row, end_col) {
+        SelectionRange {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+        }
+    } else {
+        SelectionRange {
+            start_row: end_row,
+            start_col: end_col,
+            end_row: start_row,
+            end_col: start_col,
+        }
+    }
+}
+
+fn position_to_offset(text: &str, row: usize, col: usize) -> Option<usize> {
+    let mut cur_row = 0usize;
+    let mut cur_col = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if cur_row == row && cur_col == col {
+            return Some(byte_idx);
+        }
+        if ch == '\n' {
+            cur_row += 1;
+            cur_col = 0;
+        } else {
+            cur_col += 1;
+        }
+    }
+
+    if cur_row == row && cur_col == col {
+        return Some(text.len());
+    }
+
+    None
+}
+
+fn offset_to_position(text: &str, target_chars: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for (count, ch) in text.chars().enumerate() {
+        if count == target_chars {
+            return (row, col);
+        }
+        
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
 fn content_height() -> usize {
     let size = winsize_tty().unwrap_or(TermSize { rows: 24, cols: 80 });
     (size.rows.saturating_sub(1)).max(1) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Document;
+    use crate::buffer::Buffer;
+
+    #[test]
+    fn insert_text_replaces_selection() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("hello world");
+        doc.set_selection(0, 6, 0, 11);
+        doc.insert_text("tce");
+        assert_eq!(doc.buffer.to_file_string(), "hello tce");
+    }
 }

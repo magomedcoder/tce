@@ -1,5 +1,5 @@
-//! Text buffer: one `String` per line
-//! Cursor column is a **character** index (Unicode scalar values)
+//! Текстовый буфер: одна `String` на строку
+//! Колонка курсора хранится как индекс **символа** (Unicode scalar values)
 
 #[derive(Clone, Debug, Default)]
 pub struct Buffer {
@@ -48,7 +48,7 @@ impl Buffer {
         self.lines.get(row).map(|s| s.chars().count()).unwrap_or(0)
     }
 
-    /// Join lines with `\n` for saving (no trailing newline unless last line empty? standard: join with \n)
+    /// Объединяет строки через `\n` для сохранения
     pub fn to_file_string(&self) -> String {
         self.lines.join("\n")
     }

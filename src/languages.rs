@@ -1,8 +1,8 @@
-//! First-wave source languages (aligned with the LSP roadmap: Rust, TS/JS, Python, Go)
+//! Roadmap LSP: Rust, TS/JS, Python, Go)
 
 use std::path::{Path, PathBuf};
 
-/// File extensions treated as first-class in the MVP (syntax today, LSP later)
+/// Расширения файлов, считающиеся приоритетными (позже LSP)
 pub const FIRST_WAVE_EXTENSIONS: &[&str] = &[
     "rs", "py", "pyi", "go", "ts", "tsx", "js", "jsx", "mjs", "cjs",
 ];
