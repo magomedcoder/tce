@@ -2,9 +2,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::buffer::Buffer;
-use crate::keys::Key;
-use crate::terminal::{winsize_tty, TermSize};
+use crate::core::buffer::Buffer;
+use crate::core::keys::Key;
+use crate::core::terminal::{winsize_tty, TermSize};
 
 #[derive(Clone)]
 struct Snapshot {
@@ -76,6 +76,23 @@ impl Document {
         })
     }
 
+    pub fn new_file(path: PathBuf) -> Self {
+        Self {
+            buffer: Buffer::new(),
+            row: 0,
+            col: 0,
+            scroll_row: 0,
+            hscroll: 0,
+            path: Some(path),
+            dirty: false,
+            pinned: false,
+            force_quit_pending: false,
+            selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+        }
+    }
+
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             text: self.buffer.to_file_string(),
@@ -135,6 +152,11 @@ impl Document {
 
     pub fn save(&mut self) -> io::Result<()> {
         if let Some(ref p) = self.path {
+            if let Some(parent) = p.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
             fs::write(p, self.buffer.to_file_string())?;
             self.dirty = false;
         }
@@ -472,7 +494,10 @@ fn content_height() -> usize {
 #[cfg(test)]
 mod tests {
     use super::Document;
-    use crate::buffer::Buffer;
+    use crate::core::buffer::Buffer;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn insert_text_replaces_selection() {
@@ -481,5 +506,33 @@ mod tests {
         doc.set_selection(0, 6, 0, 11);
         doc.insert_text("tce");
         assert_eq!(doc.buffer.to_file_string(), "hello tce");
+    }
+
+    #[test]
+    fn new_file_keeps_target_path() {
+        let path = PathBuf::from("/tmp/new-file.txt");
+        let doc = Document::new_file(path.clone());
+        assert_eq!(doc.path, Some(path));
+        assert!(!doc.dirty);
+        assert_eq!(doc.buffer.to_file_string(), "");
+    }
+
+    #[test]
+    fn save_creates_missing_parent_dirs() {
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tce-save-test-{uniq}"));
+        let path = root.join("nested/dir/file.txt");
+
+        let mut doc = Document::new_file(path.clone());
+        doc.insert_text("hello");
+        doc.save().expect("save should create parent directories");
+
+        let saved = fs::read_to_string(&path).expect("saved file should exist");
+        assert_eq!(saved, "hello");
+
+        let _ = fs::remove_dir_all(root);
     }
 }

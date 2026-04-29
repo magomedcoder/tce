@@ -1,0 +1,9 @@
+pub const ASK: &str = "llm_ask";
+pub const HISTORY: &str = "llm_history";
+pub const AGENT_EVENTS: &str = "agent_events";
+pub const AGENT_TOGGLE_UNSAFE: &str = "agent_toggle_unsafe_tools";
+pub const HISTORY_CLEAR: &str = "llm_history_clear";
+pub const INSERT_LAST: &str = "llm_insert_last_answer";
+pub const HEALTH: &str = "llm_health";
+pub const EXPLAIN_LINE: &str = "llm_explain_current_line";
+pub const AGENT_RUN_LOOP: &str = "agent_run_loop";

@@ -1,20 +1,17 @@
-//! Roadmap LSP: Rust, TS/JS, Python, Go)
-
 use std::path::{Path, PathBuf};
 
-/// Расширения файлов, считающиеся приоритетными (позже LSP)
+pub(crate) mod localization;
+
 pub const FIRST_WAVE_EXTENSIONS: &[&str] = &[
     "rs", "py", "pyi", "go", "ts", "tsx", "js", "jsx", "mjs", "cjs",
 ];
 
 pub fn is_first_wave_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            FIRST_WAVE_EXTENSIONS
-                .iter()
-                .any(|&x| x.eq_ignore_ascii_case(e))
-        })
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        FIRST_WAVE_EXTENSIONS
+            .iter()
+            .any(|&x| x.eq_ignore_ascii_case(e))
+    })
 }
 
 pub fn syntax_highlight_line(path: Option<&PathBuf>, line: &str) -> String {
@@ -175,7 +172,7 @@ fn highlight_slash_comment(line: &str, keywords: &[&str]) -> String {
             out.push_str("\x1b[0m");
             continue;
         }
-        
+
         if ch.is_alphabetic() || ch == '_' {
             let mut ident = String::from(ch);
             while let Some(next) = chars.peek().copied() {

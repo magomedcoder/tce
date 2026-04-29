@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::terminal::read_timeout;
+use crate::core::terminal::read_timeout;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Key {

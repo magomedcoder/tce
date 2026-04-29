@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
-use crate::agent_sandbox::{AgentSandbox, SandboxError};
+use super::agent_sandbox::{AgentSandbox, SandboxError};
 
 #[derive(Debug, Clone)]
 pub struct ToolCall {
@@ -94,8 +94,8 @@ impl AgentToolExecutor {
             .resolve_path(path)
             .map_err(sandbox_error_message)?;
         let mut entries = Vec::<Value>::new();
-        let read_dir = fs::read_dir(&resolved)
-            .map_err(|e| format!("Не удалось прочитать каталог `{path}`: {e}"))?;
+        let read_dir =
+            fs::read_dir(&resolved).map_err(|e| format!("Не удалось прочитать каталог `{path}`: {e}"))?;
 
         for item in read_dir {
             let item = item.map_err(|e| format!("Ошибка чтения элемента каталога: {e}"))?;
@@ -142,7 +142,6 @@ impl AgentToolExecutor {
                 out.push(json!(rel));
             }
         })
-
         .map_err(|e| format!("Ошибка обхода файлов: {e}"))?;
 
         Ok(json!({
@@ -214,7 +213,9 @@ impl AgentToolExecutor {
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
-    args.get(key).and_then(Value::as_str).ok_or_else(|| format!("Аргумент `{key}` обязателен и должен быть строкой"))
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Аргумент `{key}` обязателен и должен быть строкой"))
 }
 
 fn arg_str_opt<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
@@ -234,7 +235,11 @@ fn sandbox_error_message(error: SandboxError) -> String {
 }
 
 fn rel_from_root(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root).ok().unwrap_or(path).to_string_lossy().to_string()
+    path.strip_prefix(root)
+        .ok()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn visit_files<F>(base: &Path, on_file: &mut F) -> std::io::Result<()>
@@ -313,7 +318,8 @@ mod tests {
         let root = mk_temp_dir();
         fs::create_dir_all(root.join("src")).expect("должен создаться каталог src");
         fs::write(root.join("src/main.rs"), "fn main() {}\n").expect("должен записаться main.rs");
-        fs::write(root.join("src/lib.rs"), "pub fn sum(a: i32, b: i32) -> i32 { a + b }\n").expect("должен записаться lib.rs");
+        fs::write(root.join("src/lib.rs"), "pub fn sum(a: i32, b: i32) -> i32 { a + b }\n")
+            .expect("должен записаться lib.rs");
         fs::write(root.join("README.md"), "Project tce\n").expect("должен записаться README");
 
         let sandbox = AgentSandbox::new(root.clone(), 1024).expect("должна создаться песочница");
@@ -363,7 +369,12 @@ mod tests {
             .and_then(Value::as_array)
             .expect("entries должен быть массивом");
 
-        assert!(entries.iter().any(|e| e.get("name").and_then(Value::as_str) == Some("src")), "в списке должен быть каталог src");
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.get("name").and_then(Value::as_str) == Some("src")),
+            "в списке должен быть каталог src"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -387,7 +398,10 @@ mod tests {
             .and_then(Value::as_array)
             .expect("matches должен быть массивом");
 
-        assert!(matches.iter().any(|v| v.as_str() == Some("src/main.rs")), "должен найтись файл src/main.rs");
+        assert!(
+            matches.iter().any(|v| v.as_str() == Some("src/main.rs")),
+            "должен найтись файл src/main.rs"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -413,7 +427,8 @@ mod tests {
 
         assert!(
             matches.iter().any(|v| {
-                v.get("path").and_then(Value::as_str) == Some("src/lib.rs") && v.get("line").and_then(Value::as_u64) == Some(1)
+                v.get("path").and_then(Value::as_str) == Some("src/lib.rs")
+                    && v.get("line").and_then(Value::as_u64) == Some(1)
             }),
             "должна найтись строка с sum в src/lib.rs"
         );
@@ -435,7 +450,10 @@ mod tests {
         assert!(!result.ok, "опасный инструмент должен блокироваться");
 
         let err = result.error.unwrap_or_default();
-        assert!(err.contains("требует подтверждения"), "должно быть сообщение про подтверждение опасного инструмента");
+        assert!(
+            err.contains("требует подтверждения"),
+            "должно быть сообщение про подтверждение опасного инструмента"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -1,12 +1,12 @@
-use std::time::Duration;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_orchestrator::{AgentStepRequest, AgentStepResponse};
-use crate::settings::AppSettings;
+use super::agent_orchestrator::{AgentStepRequest, AgentStepResponse};
+use crate::core::settings::AppSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorBody {
@@ -112,20 +112,16 @@ impl TceLlmClient {
             .build_agent()
             .get(&format!("{}/tce/v1/health", self.base_url));
 
-        let mut res = req
-            .call()
-            .map_err(map_ureq_error)?;
+        let mut res = req.call().map_err(map_ureq_error)?;
         let status = res.status();
-        let body = res
-            .body_mut()
-            .read_to_string()
-            .map_err(map_ureq_error)?;
+        let body = res.body_mut().read_to_string().map_err(map_ureq_error)?;
 
         if !status.is_success() {
             return Err(parse_api_error_or_protocol(&body));
         }
 
-        serde_json::from_str::<HealthResponse>(&body).map_err(|e| LlmApiError::Protocol(format!("ошибка разбора health-ответа: {e}")))
+        serde_json::from_str::<HealthResponse>(&body)
+            .map_err(|e| LlmApiError::Protocol(format!("ошибка разбора health-ответа: {e}")))
     }
 
     pub fn send_chat_streaming<F>(
@@ -367,7 +363,10 @@ data: {"finish":"stop"}
         let err = parse_agent_step_response(body).expect_err("должна вернуться ошибка протокола");
         match err {
             LlmApiError::Protocol(msg) => {
-                assert!(msg.contains("agent-step"), "сообщение должно указывать на разбор agent-step ответа");
+                assert!(
+                    msg.contains("agent-step"),
+                    "сообщение должно указывать на разбор agent-step ответа"
+                );
             }
             _ => panic!("ожидалась ошибка типа Protocol"),
         }

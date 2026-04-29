@@ -3,9 +3,9 @@ use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-use crate::keys::read_key;
-use crate::terminal::RawMode;
-use crate::welcome::{Welcome, WelcomeAction};
+use crate::core::keys::read_key;
+use crate::core::terminal::RawMode;
+use crate::plugins::core_ui::welcome::{Welcome, WelcomeAction};
 use crate::workspace::Workspace;
 
 enum Phase {
@@ -22,11 +22,20 @@ impl App {
         let phase = match arg {
             None => Phase::Welcome(Welcome::new()),
             Some(p) => {
-                let meta = fs::metadata(&p)?;
-                if meta.is_dir() {
-                    Phase::Workspace(Workspace::open_dir(p)?)
-                } else {
-                    Phase::Workspace(Workspace::open_file_in_project(p)?)
+                match fs::metadata(&p) {
+                    Ok(meta) => {
+                        if meta.is_dir() {
+                            Phase::Workspace(Workspace::open_dir(p)?)
+                        } else {
+                            Phase::Workspace(Workspace::open_file_in_project(p)?)
+                        }
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        // Разрешаем запуск с новым файлом:
+                        // `tce path/to/new_file.rs` открывает пустой буфер с привязкой к пути.
+                        Phase::Workspace(Workspace::open_file_in_project(p)?)
+                    }
+                    Err(err) => return Err(err),
                 }
             }
         };

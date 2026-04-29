@@ -161,7 +161,10 @@ mod tests {
             .read_file("big.txt")
             .expect_err("должна сработать защита лимита чтения");
 
-        assert!(matches!(err, SandboxError::ReadLimitExceeded { max_bytes: 4 }), "ожидается ошибка превышения лимита чтения");
+        assert!(
+            matches!(err, SandboxError::ReadLimitExceeded { max_bytes: 4 }),
+            "ожидается ошибка превышения лимита чтения"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

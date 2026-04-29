@@ -1,35 +1,11 @@
 #[cfg(unix)]
-mod agent_sandbox;
-#[cfg(unix)]
-mod agent_tools;
-#[cfg(unix)]
-mod agent_orchestrator;
-#[cfg(unix)]
 mod app;
 #[cfg(unix)]
-mod buffer;
-#[cfg(unix)]
-mod document;
-#[cfg(unix)]
-mod keys;
-#[cfg(unix)]
-mod languages;
+mod core;
 #[cfg(unix)]
 mod localization;
 #[cfg(unix)]
-mod recents;
-#[cfg(unix)]
-mod session;
-#[cfg(unix)]
-mod settings;
-#[cfg(unix)]
-mod terminal;
-#[cfg(unix)]
-mod llm_api;
-#[cfg(unix)]
-mod tree;
-#[cfg(unix)]
-mod welcome;
+mod plugins;
 #[cfg(unix)]
 mod workspace;
 

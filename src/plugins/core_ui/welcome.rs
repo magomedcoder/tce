@@ -1,11 +1,11 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::keys::Key;
+use crate::core::keys::Key;
 use crate::localization::{texts, Language};
-use crate::recents;
-use crate::settings;
-use crate::terminal::{winsize_tty, TermSize};
+use crate::core::recents;
+use crate::core::settings;
+use crate::core::terminal::{winsize_tty, TermSize};
 
 pub enum WelcomeAction {
     OpenProject(PathBuf, Language),
@@ -48,7 +48,11 @@ impl Welcome {
             selected: 0,
             language: app_settings.language,
             language_picker: false,
-            language_sel: if app_settings.language == Language::En { 0 } else { 1 },
+            language_sel: if app_settings.language == Language::En {
+                0
+            } else {
+                1
+            },
             hotkeys_help: false,
             folder_browser: false,
             path_input: None,
@@ -92,10 +96,7 @@ impl Welcome {
             for (i, p) in self.recents.iter().enumerate().take(max_list) {
                 let mark = if i == self.selected { "› " } else { "  " };
                 let s = p.to_string_lossy();
-                lines.push(format!(
-                    "{mark}{}",
-                    truncate_str(&s, cols.saturating_sub(4))
-                ));
+                lines.push(format!("{mark}{}", truncate_str(&s, cols.saturating_sub(4))));
             }
         }
         lines.push(tx.welcome_open_new_quit.to_string());
@@ -631,7 +632,12 @@ fn expand_tilde(input: &str) -> String {
     input.to_string()
 }
 
-fn render_folder_item(item: &FolderEntry, selected: bool, tx: &crate::localization::Texts, max: usize) -> String {
+fn render_folder_item(
+    item: &FolderEntry,
+    selected: bool,
+    tx: &crate::localization::Texts,
+    max: usize,
+) -> String {
     let label = match item {
         FolderEntry::OpenCurrent => tx.welcome_folder_open_current.to_string(),
         FolderEntry::GoHome => tx.welcome_folder_home.to_string(),
@@ -642,7 +648,7 @@ fn render_folder_item(item: &FolderEntry, selected: bool, tx: &crate::localizati
             format!("{name}/")
         }
     };
-    
+
     let clipped = truncate_str(&label, max);
     if selected {
         format!("\x1b[7m> {clipped}\x1b[0m")

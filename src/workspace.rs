@@ -6,26 +6,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use regex::Regex;
 
-use crate::agent_orchestrator::AgentOrchestrator;
-use crate::agent_sandbox::AgentSandbox;
-use crate::agent_tools::AgentToolExecutor;
-use crate::document::Document;
-use crate::keys::Key;
+use crate::plugins::llm::agent_orchestrator::AgentOrchestrator;
+use crate::plugins::llm::agent_sandbox::AgentSandbox;
+use crate::plugins::llm::agent_tools::AgentToolExecutor;
+use crate::core::document::Document;
+use crate::core::keys::Key;
 use crate::localization::{texts, Language};
-use crate::recents;
-use crate::session;
-use crate::settings;
-use crate::terminal::{winsize_tty, TermSize};
-use crate::llm_api::{
+use crate::core::recents;
+use crate::core::session;
+use crate::core::settings;
+use crate::core::terminal::{winsize_tty, TermSize};
+use crate::plugins::llm::llm_api::{
     ChatMessage as LlmChatMessage, 
     ChatRequest as LlmChatRequest, 
     EditorContext as LlmEditorContext,
     GenerateParams as LlmGenerateParams, 
     TceLlmClient,
 };
-use crate::tree::{self as filetree, TreeEntry};
-use crate::buffer::Buffer;
-use crate::languages;
+use crate::plugins;
+use crate::plugins::filesystem::{self as filetree, TreeEntry};
+use crate::core::buffer::Buffer;
+use crate::plugins::languages;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -469,7 +470,11 @@ impl Workspace {
         let root = root.canonicalize().unwrap_or(root);
         let file_canon = file.canonicalize().unwrap_or_else(|_| file.clone());
         let mut ws = Self::open_project(root)?;
-        ws.docs = vec![Document::open_file(file)?];
+        ws.docs = vec![if file.exists() {
+            Document::open_file(file.clone())?
+        } else {
+            Document::new_file(file.clone())
+        }];
         ws.active_doc = 0;
         ws.tab_sel = 0;
         ws.tree_sel = ws.tree.iter().position(|e| e.path == file_canon).unwrap_or(ws.tree_sel);
@@ -717,38 +722,12 @@ impl Workspace {
         let status: String = status.chars().take(cols).collect();
         out.push_str(&status);
 
-        if self.sidebar_menu_open {
-            self.render_sidebar_menu_overlay(&mut out, cols, rows);
-        } else if self.agent_unsafe_confirm {
-            self.render_agent_unsafe_confirm_overlay(&mut out, cols, rows);
-        } else if self.sidebar_prompt.is_some() {
-            self.render_sidebar_prompt_overlay(&mut out, cols, rows);
-        } else if self.go_to_line.is_some() {
+        if self.go_to_line.is_some() {
             self.render_go_to_line_overlay(&mut out, cols, rows);
-        } else if self.llm_prompt.is_some() {
-            self.render_llm_prompt_overlay(&mut out, cols, rows);
-        } else if self.multi_edit.is_some() {
-            self.render_multi_edit_overlay(&mut out, cols, rows);
-        } else if self.sync_edit.is_some() {
-            self.render_sync_edit_overlay(&mut out, cols, rows);
         } else if self.command_palette.is_some() {
             self.render_command_palette_overlay(&mut out, cols, rows);
-        } else if self.llm_history_view.is_some() {
-            self.render_llm_history_overlay(&mut out, cols, rows);
-        } else if self.agent_events_view.is_some() {
-            self.render_agent_events_overlay(&mut out, cols, rows);
-        } else if self.diagnostics.as_ref().is_some_and(|d| d.open) {
-            self.render_diagnostics_overlay(&mut out, cols, rows);
-        } else if self.git_view.is_some() {
-            self.render_git_view_overlay(&mut out, cols, rows);
-        } else if self.symbol_jump.is_some() {
-            self.render_symbol_jump_overlay(&mut out, cols, rows);
-        } else if self.project_search.is_some() {
-            self.render_project_search_overlay(&mut out, cols, rows);
-        } else if self.in_file_find.is_some() {
-            self.render_in_file_find_overlay(&mut out, cols, rows);
-        } else if self.quick_open.is_some() {
-            self.render_quick_open_overlay(&mut out, cols, rows);
+        } else if plugins::builtin_registry().render_overlay(self, &mut out, cols, rows) {
+            // Overlay отрисован плагином
         }
 
         let (sr, sc) = self.cursor_screen_pos(content_h, cols, sidebar_w, right_panel_on, right_panel_w);
@@ -1025,83 +1004,8 @@ impl Workspace {
             return Ok(false);
         }
 
-        if self.agent_unsafe_confirm {
-            self.handle_agent_unsafe_confirm_key(key);
-            return Ok(false);
-        }
-
-        if self.sidebar_prompt.is_some() {
-            self.handle_sidebar_prompt_key(key);
-            return Ok(false);
-        }
-
-        if self.quick_open.is_some() {
-            self.handle_quick_open_key(key);
-            return Ok(false);
-        }
-
-        if self.in_file_find.is_some() {
-            self.handle_in_file_find_key(key);
-            return Ok(false);
-        }
-        
-        if self.project_search.is_some() {
-            self.handle_project_search_key(key);
-            return Ok(false);
-        }
-
-        if self.symbol_jump.is_some() {
-            self.handle_symbol_jump_key(key);
-            return Ok(false);
-        }
-
-        if self.go_to_line.is_some() {
-            self.handle_go_to_line_key(key);
-            return Ok(false);
-        }
-
-        if self.llm_prompt.is_some() {
-            self.handle_llm_prompt_key(key);
-            return Ok(false);
-        }
-
-        if self.multi_edit.is_some() {
-            self.handle_multi_edit_key(key);
-            return Ok(false);
-        }
-
-        if self.sync_edit.is_some() {
-            self.handle_sync_edit_key(key);
-            return Ok(false);
-        }
-
         if self.command_palette.is_some() {
             self.handle_command_palette_key(key);
-            return Ok(false);
-        }
-
-        if self.llm_history_view.is_some() {
-            self.handle_llm_history_view_key(key);
-            return Ok(false);
-        }
-
-        if self.agent_events_view.is_some() {
-            self.handle_agent_events_view_key(key);
-            return Ok(false);
-        }
-
-        if self.diagnostics.as_ref().is_some_and(|d| d.open) {
-            self.handle_diagnostics_key(key);
-            return Ok(false);
-        }
-
-        if self.git_view.is_some() {
-            self.handle_git_view_key(key);
-            return Ok(false);
-        }
-
-        if self.sidebar_menu_open {
-            self.handle_sidebar_menu_key(key);
             return Ok(false);
         }
 
@@ -1111,6 +1015,11 @@ impl Workspace {
 
         if matches!(key, Key::CtrlS) {
             self.doc_mut().save()?;
+            return Ok(false);
+        }
+
+        if plugins::builtin_registry().handle_key(self, key) {
+            plugins::builtin_registry().post_handle_key(self, key);
             return Ok(false);
         }
 
@@ -1141,80 +1050,6 @@ impl Workspace {
 
         if matches!(key, Key::CtrlX) {
             self.toggle_pin_active_tab();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlB) {
-            self.sidebar_visible = !self.sidebar_visible;
-            if !self.sidebar_visible {
-                self.focus = Focus::Editor;
-            }
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlR) {
-            if Self::llm_enabled_in_settings() {
-                self.right_panel_visible = !self.right_panel_visible;
-            } else {
-                self.right_panel_visible = false;
-                self.tip = Some(texts(self.language).llm_disabled.to_string());
-            }
-            if !self.right_panel_visible && self.focus == Focus::RightPanel {
-                self.focus = Focus::Editor;
-            }
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlL) {
-            self.language_picker = true;
-            self.language_sel = if self.language == Language::En { 0 } else { 1 };
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlH) {
-            self.hotkeys_help = true;
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlO) {
-            self.quick_open = Some(QuickOpenState::default());
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlF) {
-            self.project_search = Some(ProjectSearchState::default());
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlG) {
-            self.llm_prompt = Some(LlmPromptState::default());
-            self.focus = Focus::Editor;
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlBackslash) {
-            let w = self.word_under_cursor();
-            let seed = if w.chars().count() > 80 {
-                String::new()
-            } else {
-                w
-            };
-            
-            self.in_file_find = Some(InFileFindState {
-                query: seed,
-                sel: 0,
-            });
-
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlT) {
-            self.symbol_jump = Some(SymbolJumpState::default());
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlY) {
-            self.go_to_line = Some(GoToLineState::default());
             return Ok(false);
         }
 
@@ -1264,11 +1099,6 @@ impl Workspace {
             return Ok(false);
         }
 
-        if self.sidebar_visible && self.focus == Focus::Sidebar {
-            self.handle_sidebar_key(key);
-            return Ok(false);
-        }
-
         if self.focus == Focus::RightPanel {
             self.handle_right_panel_key(key);
             return Ok(false);
@@ -1290,6 +1120,7 @@ impl Workspace {
                 }
             }
         }
+        plugins::builtin_registry().post_handle_key(self, key);
         Ok(false)
     }
 
@@ -2899,46 +2730,10 @@ impl Workspace {
         doc.clamp_cursor();
     }
 
-    fn command_palette_items(&self) -> Vec<(&'static str, &'static str)> {
-        let llm_enabled = Self::llm_enabled_in_settings();
-        let mut items = vec![
-            (texts(self.language).cmd_toggle_sidebar, "toggle_sidebar"),
-            (texts(self.language).cmd_toggle_right_panel, "toggle_right_panel"),
-            (texts(self.language).cmd_toggle_theme, "toggle_theme"),
-            (texts(self.language).cmd_toggle_autosave, "toggle_autosave"),
-            (texts(self.language).cmd_rust_check_current, "rust_check_current"),
-            (texts(self.language).cmd_show_diagnostics, "show_diagnostics"),
-            (texts(self.language).cmd_increase_font, "font_plus"),
-            (texts(self.language).cmd_decrease_font, "font_minus"),
-            (texts(self.language).cmd_toggle_line_spacing, "toggle_line_spacing"),
-            (texts(self.language).cmd_toggle_ligatures, "toggle_ligatures"),
-            (texts(self.language).cmd_quick_open_file, "quick_open"),
-            (texts(self.language).cmd_search_in_project, "project_search"),
-            (texts(self.language).cmd_go_to_symbol, "go_symbol"),
-            (texts(self.language).cmd_go_to_line, "go_line"),
-            (texts(self.language).cmd_toggle_pin_tab, "toggle_pin"),
-            (texts(self.language).cmd_show_hotkeys, "show_help"),
-            (texts(self.language).cmd_language_picker, "language_picker"),
-            (texts(self.language).cmd_lsp_wave, "lsp_wave_extensions"),
-            (texts(self.language).cmd_find_in_file, "in_file_find"),
-            (texts(self.language).cmd_git_status, "git_status"),
-            (texts(self.language).cmd_git_diff_unstaged, "git_diff_unstaged"),
-            (texts(self.language).cmd_git_diff_staged, "git_diff_staged"),
-            (texts(self.language).cmd_git_recent_commits, "git_log"),
-        ];
-        if llm_enabled {
-            items.extend_from_slice(&[
-                (texts(self.language).cmd_llm_ask, "llm_ask"),
-                (texts(self.language).cmd_llm_show_history, "llm_history"),
-                (texts(self.language).cmd_agent_show_events, "agent_events"),
-                (texts(self.language).cmd_agent_toggle_unsafe_tools, "agent_toggle_unsafe_tools"),
-                (texts(self.language).cmd_llm_clear_history, "llm_history_clear"),
-                (texts(self.language).cmd_llm_insert_last_answer, "llm_insert_last_answer"),
-                (texts(self.language).cmd_llm_health_check, "llm_health"),
-                (texts(self.language).cmd_llm_explain_current_line, "llm_explain_current_line"),
-                (texts(self.language).cmd_agent_run_loop, "agent_run_loop"),
-            ]);
-        }
+    fn command_palette_items(&self) -> Vec<(String, String)> {
+        let mut items = Vec::<(String, String)>::new();
+        let plugin_items = plugins::builtin_registry().palette_commands(self);
+        items.extend(plugin_items.into_iter().map(|c| (c.title, c.id)));
         if let Some(state) = &self.command_palette {
             let q = state.query.to_lowercase();
             if !q.is_empty() {
@@ -3007,145 +2802,463 @@ impl Workspace {
                     .as_ref()
                     .map(|s| s.sel.min(items.len().saturating_sub(1)))
                     .unwrap_or(0);
-                let cmd = items[idx].1;
+                let cmd = items[idx].1.clone();
                 self.command_palette = None;
-                self.run_palette_command(cmd);
+                self.run_palette_command(&cmd);
             }
             _ => {}
         }
     }
 
     fn run_palette_command(&mut self, cmd: &str) {
-        match cmd {
-            "toggle_sidebar" => {
-                self.sidebar_visible = !self.sidebar_visible;
-                if !self.sidebar_visible {
-                    self.focus = Focus::Editor;
-                }
-            }
-            "toggle_right_panel" => {
-                if Self::llm_enabled_in_settings() {
-                    self.right_panel_visible = !self.right_panel_visible;
-                } else {
-                    self.right_panel_visible = false;
-                    self.tip = Some(texts(self.language).llm_disabled.to_string());
-                }
-                if !self.right_panel_visible && self.focus == Focus::RightPanel {
-                    self.focus = Focus::Editor;
-                }
-            }
-            "toggle_theme" => self.dark_theme = !self.dark_theme,
-            "toggle_autosave" => {
-                self.autosave_on_edit = !self.autosave_on_edit;
-                self.tip = Some(if self.autosave_on_edit {
-                    texts(self.language).tip_autosave_enabled.to_string()
-                } else {
-                    texts(self.language).tip_autosave_disabled.to_string()
-                });
-            }
-            "rust_check_current" => {
-                self.run_rust_check_current_file();
-            }
-            "show_diagnostics" => {
-                if let Some(d) = self.diagnostics.as_mut() {
-                    d.open = true;
-                } else {
-                    self.tip = Some(texts(self.language).tip_no_diagnostics_yet.to_string());
-                }
-            }
-            "font_plus" => {
-                self.font_zoom = (self.font_zoom + 1).min(4);
-                self.tip = Some(texts(self.language).tip_font_zoom_fmt.replace("{}", &self.font_zoom.to_string()));
-            }
-            "font_minus" => {
-                self.font_zoom = (self.font_zoom - 1).max(-2);
-                self.tip = Some(texts(self.language).tip_font_zoom_fmt.replace("{}", &self.font_zoom.to_string()));
-            }
-            "toggle_line_spacing" => {
-                self.line_spacing = !self.line_spacing;
-                self.tip = Some(if self.line_spacing {
-                    texts(self.language).tip_line_spacing_comfortable.to_string()
-                } else {
-                    texts(self.language).tip_line_spacing_compact.to_string()
-                });
-            }
-            "toggle_ligatures" => {
-                self.ligatures = !self.ligatures;
-                self.tip = Some(if self.ligatures {
-                    texts(self.language).tip_ligatures_on.to_string()
-                } else {
-                    texts(self.language).tip_ligatures_off.to_string()
-                });
-            }
-            "quick_open" => self.quick_open = Some(QuickOpenState::default()),
-            "project_search" => self.project_search = Some(ProjectSearchState::default()),
-            "go_symbol" => self.symbol_jump = Some(SymbolJumpState::default()),
-            "go_line" => self.go_to_line = Some(GoToLineState::default()),
-            "llm_ask" => self.llm_prompt = Some(LlmPromptState::default()),
-            "llm_history" => self.llm_history_view = Some(LlmHistoryViewState::default()),
-            "agent_events" => self.agent_events_view = Some(AgentEventsViewState::default()),
-            "agent_toggle_unsafe_tools" => {
-                if self.agent_allow_unsafe_tools {
-                    self.agent_allow_unsafe_tools = false;
-                    self.tip = Some(texts(self.language).agent_unsafe_disabled.to_string());
-                } else {
-                    self.agent_unsafe_confirm = true;
-                    self.tip = Some(texts(self.language).agent_unsafe_confirm_tip.to_string());
-                }
-            }
-            "llm_history_clear" => {
-                self.llm_history.clear();
-                self.tip = Some(texts(self.language).llm_history_cleared.to_string());
-            }
-            "llm_insert_last_answer" => self.insert_last_llm_answer(),
-            "toggle_pin" => self.toggle_pin_active_tab(),
-            "show_help" => self.hotkeys_help = true,
-            "language_picker" => {
-                self.language_picker = true;
-                self.language_sel = if self.language == Language::En { 0 } else { 1 };
-            }
-            "lsp_wave_extensions" => {
-                let cur = self
-                    .doc()
-                    .path
-                    .as_deref()
-                    .is_some_and(languages::is_first_wave_path);
-                self.tip = Some(
-                    texts(self.language)
-                        .tip_lsp_wave_fmt
-                        .replacen("{}", &languages::FIRST_WAVE_EXTENSIONS.join(", "), 1)
-                        .replacen(
-                            "{}",
-                            if cur { texts(self.language).yes } else { texts(self.language).no },
-                            1,
-                        ),
-                );
-            }
-            "in_file_find" => {
-                let w = self.word_under_cursor();
-                let seed = if w.chars().count() > 80 {
-                    String::new()
-                } else {
-                    w
-                };
-                self.in_file_find = Some(InFileFindState {
-                    query: seed,
-                    sel: 0,
-                });
-            }
-            "git_status" => self.open_git_output(texts(self.language).git_title_status, &["status", "-sb"]),
-            "git_diff_unstaged" => self.open_git_output(texts(self.language).git_title_diff_unstaged, &["diff", "--stat"]),
-            "git_diff_staged" => self.open_git_output(texts(self.language).git_title_diff_staged, &["diff", "--cached", "--stat"]),
-            "git_log" => self.open_git_output(
-                texts(self.language).git_title_log,
-                &["log", "-n", "24", "--oneline", "--decorate"],
-            ),
-            "llm_health" => self.run_llm_health_check(),
-            "llm_explain_current_line" => self.run_llm_explain_current_line(),
-            "agent_run_loop" => self.run_agent_loop_mvp(),
-            _ => {}
-        }
+        let _ = plugins::builtin_registry().run_command(self, cmd);
         self.persist_settings();
+    }
+
+    pub(crate) fn plugin_toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if !self.sidebar_visible {
+            self.focus = Focus::Editor;
+        }
+    }
+
+    pub(crate) fn plugin_toggle_right_panel(&mut self) {
+        if Self::llm_enabled_in_settings() {
+            self.right_panel_visible = !self.right_panel_visible;
+        } else {
+            self.right_panel_visible = false;
+            self.tip = Some(texts(self.language).llm_disabled.to_string());
+        }
+        if !self.right_panel_visible && self.focus == Focus::RightPanel {
+            self.focus = Focus::Editor;
+        }
+    }
+
+    pub(crate) fn plugin_toggle_theme(&mut self) {
+        self.dark_theme = !self.dark_theme;
+    }
+
+    pub(crate) fn plugin_toggle_autosave(&mut self) {
+        self.autosave_on_edit = !self.autosave_on_edit;
+        self.tip = Some(if self.autosave_on_edit {
+            texts(self.language).tip_autosave_enabled.to_string()
+        } else {
+            texts(self.language).tip_autosave_disabled.to_string()
+        });
+    }
+
+    pub(crate) fn plugin_run_rust_check_current_file(&mut self) {
+        self.run_rust_check_current_file();
+    }
+
+    pub(crate) fn plugin_show_diagnostics(&mut self) {
+        if let Some(d) = self.diagnostics.as_mut() {
+            d.open = true;
+        } else {
+            self.tip = Some(texts(self.language).tip_no_diagnostics_yet.to_string());
+        }
+    }
+
+    pub(crate) fn plugin_increase_font(&mut self) {
+        self.font_zoom = (self.font_zoom + 1).min(4);
+        self.tip = Some(texts(self.language).tip_font_zoom_fmt.replace("{}", &self.font_zoom.to_string()));
+    }
+
+    pub(crate) fn plugin_decrease_font(&mut self) {
+        self.font_zoom = (self.font_zoom - 1).max(-2);
+        self.tip = Some(texts(self.language).tip_font_zoom_fmt.replace("{}", &self.font_zoom.to_string()));
+    }
+
+    pub(crate) fn plugin_toggle_line_spacing(&mut self) {
+        self.line_spacing = !self.line_spacing;
+        self.tip = Some(if self.line_spacing {
+            texts(self.language).tip_line_spacing_comfortable.to_string()
+        } else {
+            texts(self.language).tip_line_spacing_compact.to_string()
+        });
+    }
+
+    pub(crate) fn plugin_toggle_ligatures(&mut self) {
+        self.ligatures = !self.ligatures;
+        self.tip = Some(if self.ligatures {
+            texts(self.language).tip_ligatures_on.to_string()
+        } else {
+            texts(self.language).tip_ligatures_off.to_string()
+        });
+    }
+
+    pub(crate) fn plugin_toggle_pin_active_tab(&mut self) {
+        self.toggle_pin_active_tab();
+    }
+
+    pub(crate) fn plugin_show_hotkeys_help(&mut self) {
+        self.hotkeys_help = true;
+    }
+
+    pub(crate) fn plugin_open_language_picker(&mut self) {
+        self.language_picker = true;
+        self.language_sel = if self.language == Language::En { 0 } else { 1 };
+    }
+
+    pub(crate) fn plugin_show_lsp_wave_extensions(&mut self) {
+        let cur = self
+            .doc()
+            .path
+            .as_deref()
+            .is_some_and(languages::is_first_wave_path);
+        self.tip = Some(
+            texts(self.language)
+                .tip_lsp_wave_fmt
+                .replacen("{}", &languages::FIRST_WAVE_EXTENSIONS.join(", "), 1)
+                .replacen(
+                    "{}",
+                    if cur { texts(self.language).yes } else { texts(self.language).no },
+                    1,
+                ),
+        );
+    }
+
+    pub(crate) fn current_language(&self) -> Language {
+        self.language
+    }
+
+    pub(crate) fn is_llm_enabled_in_settings(&self) -> bool {
+        Self::llm_enabled_in_settings()
+    }
+
+    pub(crate) fn open_quick_open(&mut self) {
+        self.quick_open = Some(QuickOpenState::default());
+    }
+
+    pub(crate) fn open_project_search(&mut self) {
+        self.project_search = Some(ProjectSearchState::default());
+    }
+
+    pub(crate) fn open_symbol_jump(&mut self) {
+        self.symbol_jump = Some(SymbolJumpState::default());
+    }
+
+    pub(crate) fn open_go_to_line(&mut self) {
+        self.go_to_line = Some(GoToLineState::default());
+    }
+
+    pub(crate) fn open_in_file_find_seeded(&mut self) {
+        let w = self.word_under_cursor();
+        let seed = if w.chars().count() > 80 {
+            String::new()
+        } else {
+            w
+        };
+        self.in_file_find = Some(InFileFindState {
+            query: seed,
+            sel: 0,
+        });
+    }
+
+    pub(crate) fn plugin_open_git_status(&mut self) {
+        self.open_git_output(texts(self.language).git_title_status, &["status", "-sb"]);
+    }
+
+    pub(crate) fn plugin_open_git_diff_unstaged(&mut self) {
+        self.open_git_output(texts(self.language).git_title_diff_unstaged, &["diff", "--stat"]);
+    }
+
+    pub(crate) fn plugin_open_git_diff_staged(&mut self) {
+        self.open_git_output(
+            texts(self.language).git_title_diff_staged,
+            &["diff", "--cached", "--stat"],
+        );
+    }
+
+    pub(crate) fn plugin_open_git_log(&mut self) {
+        self.open_git_output(
+            texts(self.language).git_title_log,
+            &["log", "-n", "24", "--oneline", "--decorate"],
+        );
+    }
+
+    pub(crate) fn open_llm_prompt(&mut self) {
+        if Self::llm_enabled_in_settings() {
+            self.llm_prompt = Some(LlmPromptState::default());
+        } else {
+            self.tip = Some(texts(self.language).llm_disabled.to_string());
+        }
+    }
+
+    pub(crate) fn plugin_focus_editor(&mut self) {
+        self.focus = Focus::Editor;
+    }
+
+    pub(crate) fn open_llm_history(&mut self) {
+        self.llm_history_view = Some(LlmHistoryViewState::default());
+    }
+
+    pub(crate) fn open_agent_events(&mut self) {
+        self.agent_events_view = Some(AgentEventsViewState::default());
+    }
+
+    pub(crate) fn toggle_unsafe_agent_tools(&mut self) {
+        if self.agent_allow_unsafe_tools {
+            self.agent_allow_unsafe_tools = false;
+            self.tip = Some(texts(self.language).agent_unsafe_disabled.to_string());
+        } else {
+            self.agent_unsafe_confirm = true;
+            self.tip = Some(texts(self.language).agent_unsafe_confirm_tip.to_string());
+        }
+    }
+
+    pub(crate) fn clear_llm_history(&mut self) {
+        self.llm_history.clear();
+        self.tip = Some(texts(self.language).llm_history_cleared.to_string());
+    }
+
+    pub(crate) fn plugin_insert_last_llm_answer(&mut self) {
+        self.insert_last_llm_answer();
+    }
+
+    pub(crate) fn plugin_run_llm_health_check(&mut self) {
+        self.run_llm_health_check();
+    }
+
+    pub(crate) fn plugin_run_llm_explain_current_line(&mut self) {
+        self.run_llm_explain_current_line();
+    }
+
+    pub(crate) fn plugin_run_agent_loop_mvp(&mut self) {
+        self.run_agent_loop_mvp();
+    }
+
+    pub(crate) fn plugin_render_assistant_overlays(
+        &self,
+        out: &mut String,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        if self.agent_unsafe_confirm {
+            self.render_agent_unsafe_confirm_overlay(out, cols, rows);
+            return true;
+        }
+        if self.llm_prompt.is_some() {
+            self.render_llm_prompt_overlay(out, cols, rows);
+            return true;
+        }
+        if self.multi_edit.is_some() {
+            self.render_multi_edit_overlay(out, cols, rows);
+            return true;
+        }
+        if self.sync_edit.is_some() {
+            self.render_sync_edit_overlay(out, cols, rows);
+            return true;
+        }
+        if self.llm_history_view.is_some() {
+            self.render_llm_history_overlay(out, cols, rows);
+            return true;
+        }
+        if self.agent_events_view.is_some() {
+            self.render_agent_events_overlay(out, cols, rows);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn plugin_render_navigation_overlays(
+        &self,
+        out: &mut String,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        if self.go_to_line.is_some() {
+            self.render_go_to_line_overlay(out, cols, rows);
+            return true;
+        }
+        if self.symbol_jump.is_some() {
+            self.render_symbol_jump_overlay(out, cols, rows);
+            return true;
+        }
+        if self.project_search.is_some() {
+            self.render_project_search_overlay(out, cols, rows);
+            return true;
+        }
+        if self.in_file_find.is_some() {
+            self.render_in_file_find_overlay(out, cols, rows);
+            return true;
+        }
+        if self.quick_open.is_some() {
+            self.render_quick_open_overlay(out, cols, rows);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn plugin_render_git_overlay(
+        &self,
+        out: &mut String,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        if self.git_view.is_some() {
+            self.render_git_view_overlay(out, cols, rows);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn plugin_is_diagnostics_open(&self) -> bool {
+        self.diagnostics.as_ref().is_some_and(|d| d.open)
+    }
+
+    pub(crate) fn plugin_handle_diagnostics_key(&mut self, key: Key) {
+        self.handle_diagnostics_key(key);
+    }
+
+    pub(crate) fn plugin_render_diagnostics_overlay(
+        &self,
+        out: &mut String,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        if self.diagnostics.as_ref().is_some_and(|d| d.open) {
+            self.render_diagnostics_overlay(out, cols, rows);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn plugin_is_sidebar_prompt_active(&self) -> bool {
+        self.sidebar_prompt.is_some()
+    }
+
+    pub(crate) fn plugin_is_sidebar_menu_open(&self) -> bool {
+        self.sidebar_menu_open
+    }
+
+    pub(crate) fn plugin_is_sidebar_focused(&self) -> bool {
+        self.sidebar_visible && self.focus == Focus::Sidebar
+    }
+
+    pub(crate) fn plugin_handle_sidebar_prompt_key(&mut self, key: Key) {
+        self.handle_sidebar_prompt_key(key);
+    }
+
+    pub(crate) fn plugin_handle_sidebar_menu_key(&mut self, key: Key) {
+        self.handle_sidebar_menu_key(key);
+    }
+
+    pub(crate) fn plugin_handle_sidebar_key(&mut self, key: Key) {
+        self.handle_sidebar_key(key);
+    }
+
+    pub(crate) fn plugin_render_filesystem_overlays(
+        &self,
+        out: &mut String,
+        cols: usize,
+        rows: usize,
+    ) -> bool {
+        if self.sidebar_menu_open {
+            self.render_sidebar_menu_overlay(out, cols, rows);
+            return true;
+        }
+        if self.sidebar_prompt.is_some() {
+            self.render_sidebar_prompt_overlay(out, cols, rows);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn plugin_is_quick_open_active(&self) -> bool {
+        self.quick_open.is_some()
+    }
+
+    pub(crate) fn plugin_is_in_file_find_active(&self) -> bool {
+        self.in_file_find.is_some()
+    }
+
+    pub(crate) fn plugin_is_project_search_active(&self) -> bool {
+        self.project_search.is_some()
+    }
+
+    pub(crate) fn plugin_is_symbol_jump_active(&self) -> bool {
+        self.symbol_jump.is_some()
+    }
+
+    pub(crate) fn plugin_is_go_to_line_active(&self) -> bool {
+        self.go_to_line.is_some()
+    }
+
+    pub(crate) fn plugin_handle_quick_open_key(&mut self, key: Key) {
+        self.handle_quick_open_key(key);
+    }
+
+    pub(crate) fn plugin_handle_in_file_find_key(&mut self, key: Key) {
+        self.handle_in_file_find_key(key);
+    }
+
+    pub(crate) fn plugin_handle_project_search_key(&mut self, key: Key) {
+        self.handle_project_search_key(key);
+    }
+
+    pub(crate) fn plugin_handle_symbol_jump_key(&mut self, key: Key) {
+        self.handle_symbol_jump_key(key);
+    }
+
+    pub(crate) fn plugin_handle_go_to_line_key(&mut self, key: Key) {
+        self.handle_go_to_line_key(key);
+    }
+
+    pub(crate) fn plugin_is_git_view_open(&self) -> bool {
+        self.git_view.is_some()
+    }
+
+    pub(crate) fn plugin_handle_git_view_key(&mut self, key: Key) {
+        self.handle_git_view_key(key);
+    }
+
+    pub(crate) fn plugin_is_agent_unsafe_confirm_active(&self) -> bool {
+        self.agent_unsafe_confirm
+    }
+
+    pub(crate) fn plugin_handle_agent_unsafe_confirm_key(&mut self, key: Key) {
+        self.handle_agent_unsafe_confirm_key(key);
+    }
+
+    pub(crate) fn plugin_is_llm_prompt_active(&self) -> bool {
+        self.llm_prompt.is_some()
+    }
+
+    pub(crate) fn plugin_handle_llm_prompt_key(&mut self, key: Key) {
+        self.handle_llm_prompt_key(key);
+    }
+
+    pub(crate) fn plugin_is_multi_edit_active(&self) -> bool {
+        self.multi_edit.is_some()
+    }
+
+    pub(crate) fn plugin_handle_multi_edit_key(&mut self, key: Key) {
+        self.handle_multi_edit_key(key);
+    }
+
+    pub(crate) fn plugin_is_sync_edit_active(&self) -> bool {
+        self.sync_edit.is_some()
+    }
+
+    pub(crate) fn plugin_handle_sync_edit_key(&mut self, key: Key) {
+        self.handle_sync_edit_key(key);
+    }
+
+    pub(crate) fn plugin_is_llm_history_view_active(&self) -> bool {
+        self.llm_history_view.is_some()
+    }
+
+    pub(crate) fn plugin_handle_llm_history_view_key(&mut self, key: Key) {
+        self.handle_llm_history_view_key(key);
+    }
+
+    pub(crate) fn plugin_is_agent_events_view_active(&self) -> bool {
+        self.agent_events_view.is_some()
+    }
+
+    pub(crate) fn plugin_handle_agent_events_view_key(&mut self, key: Key) {
+        self.handle_agent_events_view_key(key);
     }
 
     fn run_llm_health_check(&mut self) {

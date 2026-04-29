@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::llm_api::TceLlmClient;
-use crate::agent_tools::{AgentToolExecutor, ToolCall};
+use super::agent_tools::{AgentToolExecutor, ToolCall};
+use super::llm_api::TceLlmClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentStepObservation {
@@ -173,7 +173,10 @@ fn summarize_patch_preview(args: &Value) -> String {
         .unwrap_or("");
 
     let preview = if first_meaningful.chars().count() > 90 {
-        format!("{}...", first_meaningful.chars().take(90).collect::<String>())
+        format!(
+            "{}...",
+            first_meaningful.chars().take(90).collect::<String>()
+        )
     } else {
         first_meaningful.to_string()
     };
@@ -195,8 +198,7 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::agent_sandbox::AgentSandbox;
-
+    use super::super::agent_sandbox::AgentSandbox;
     use super::*;
 
     struct FakeStepClient {
@@ -205,7 +207,10 @@ mod tests {
     }
 
     impl FakeStepClient {
-        fn new(steps: Vec<AgentStepResponse>, seen_requests: Rc<RefCell<Vec<AgentStepRequest>>>) -> Self {
+        fn new(
+            steps: Vec<AgentStepResponse>,
+            seen_requests: Rc<RefCell<Vec<AgentStepRequest>>>,
+        ) -> Self {
             Self {
                 steps: RefCell::new(steps),
                 seen_requests,
@@ -244,22 +249,25 @@ mod tests {
         let tools = AgentToolExecutor::new(sandbox, false);
         let seen = Rc::new(RefCell::new(Vec::<AgentStepRequest>::new()));
 
-        let client = FakeStepClient::new(vec![
-            AgentStepResponse {
-                finish: false,
-                summary: "читаю файл".to_string(),
-                calls: vec![AgentCall {
-                    tool: "read_file".to_string(),
-                    id: "call-1".to_string(),
-                    args: json!({ "path": "sample.txt" }),
-                }],
-            },
-            AgentStepResponse {
-                finish: true,
-                summary: "готово".to_string(),
-                calls: vec![],
-            },
-        ], Rc::clone(&seen));
+        let client = FakeStepClient::new(
+            vec![
+                AgentStepResponse {
+                    finish: false,
+                    summary: "читаю файл".to_string(),
+                    calls: vec![AgentCall {
+                        tool: "read_file".to_string(),
+                        id: "call-1".to_string(),
+                        args: json!({ "path": "sample.txt" }),
+                    }],
+                },
+                AgentStepResponse {
+                    finish: true,
+                    summary: "готово".to_string(),
+                    calls: vec![],
+                },
+            ],
+            Rc::clone(&seen),
+        );
 
         let orchestrator = AgentOrchestrator::new(&client, &tools, 5);
         let result = orchestrator
@@ -275,11 +283,16 @@ mod tests {
         );
 
         let seen_requests = seen.borrow();
-        assert_eq!(seen_requests.len(), 2, "должно быть два запроса к step-клиенту");
+        assert_eq!(
+            seen_requests.len(),
+            2,
+            "должно быть два запроса к step-клиенту"
+        );
         assert!(
-            seen_requests[1].observations.iter().any(|o| {
-                o.call_id == "call-1" && o.tool == "read_file" && o.ok
-            }),
+            seen_requests[1]
+                .observations
+                .iter()
+                .any(|o| { o.call_id == "call-1" && o.tool == "read_file" && o.ok }),
             "на второй шаг должны передаваться observations из первого шага"
         );
 
@@ -293,11 +306,14 @@ mod tests {
         let tools = AgentToolExecutor::new(sandbox, false);
         let seen = Rc::new(RefCell::new(Vec::<AgentStepRequest>::new()));
 
-        let client = FakeStepClient::new(vec![AgentStepResponse {
-            finish: false,
-            summary: "ещё работаю".to_string(),
-            calls: vec![],
-        }], Rc::clone(&seen));
+        let client = FakeStepClient::new(
+            vec![AgentStepResponse {
+                finish: false,
+                summary: "ещё работаю".to_string(),
+                calls: vec![],
+            }],
+            Rc::clone(&seen),
+        );
 
         let orchestrator = AgentOrchestrator::new(&client, &tools, 1);
         let result = orchestrator
@@ -306,8 +322,15 @@ mod tests {
 
         assert!(!result.finished, "должен сработать лимит шагов");
         assert_eq!(result.steps, 1);
-        assert!(result.final_summary.contains("Достигнут лимит шагов"), "в summary должен быть текст про лимит шагов");
-        assert_eq!(seen.borrow().len(),1,"при max_steps=1 должен быть ровно один запрос к step-клиенту");
+        assert!(
+            result.final_summary.contains("Достигнут лимит шагов"),
+            "в summary должен быть текст про лимит шагов"
+        );
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "при max_steps=1 должен быть ровно один запрос к step-клиенту"
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -338,12 +361,15 @@ mod tests {
             ],
             Rc::clone(&seen),
         );
-        
+
         let orchestrator = AgentOrchestrator::new(&client, &tools, 4);
         let result = orchestrator
             .run("session-1", "сделай patch")
             .expect("цикл должен завершиться успешно");
-        assert!(result.events.iter().any(|e| e.contains("diff-preview")), "должно появиться событие diff-preview для apply_patch");
+        assert!(
+            result.events.iter().any(|e| e.contains("diff-preview")),
+            "должно появиться событие diff-preview для apply_patch"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
