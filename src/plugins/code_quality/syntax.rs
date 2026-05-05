@@ -1,16 +1,12 @@
 use std::path::{Path, PathBuf};
 
-pub(crate) mod localization;
-
 pub const FIRST_WAVE_EXTENSIONS: &[&str] = &[
     "rs", "py", "pyi", "go", "ts", "tsx", "js", "jsx", "mjs", "cjs",
 ];
 
 pub fn is_first_wave_path(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        FIRST_WAVE_EXTENSIONS
-            .iter()
-            .any(|&x| x.eq_ignore_ascii_case(e))
+        FIRST_WAVE_EXTENSIONS.iter().any(|&x| x.eq_ignore_ascii_case(e))
     })
 }
 
@@ -83,9 +79,11 @@ fn highlight_hash_comment(line: &str, keywords: &[&str]) -> String {
             for c in chars {
                 out.push(c);
             }
+
             out.push_str("\x1b[0m");
             break;
         }
+
         if ch == '"' || ch == '\'' {
             out.push_str("\x1b[33m");
             out.push(ch);
@@ -98,10 +96,12 @@ fn highlight_hash_comment(line: &str, keywords: &[&str]) -> String {
                     }
                     continue;
                 }
+
                 if c == quote {
                     break;
                 }
             }
+
             out.push_str("\x1b[0m");
             continue;
         }
@@ -115,6 +115,7 @@ fn highlight_hash_comment(line: &str, keywords: &[&str]) -> String {
                     break;
                 }
             }
+            
             push_keyword_or_ident(&mut out, &ident, keywords);
             continue;
         }
@@ -133,6 +134,7 @@ fn highlight_slash_comment(line: &str, keywords: &[&str]) -> String {
             for c in chars {
                 out.push(c);
             }
+
             out.push_str("\x1b[0m");
             break;
         }
@@ -146,13 +148,16 @@ fn highlight_slash_comment(line: &str, keywords: &[&str]) -> String {
                 if c == quote {
                     break;
                 }
+
                 if c == '\\' && quote == '"' {
                     if let Some(n) = chars.next() {
                         out.push(n);
                     }
                 }
             }
+
             out.push_str("\x1b[0m");
+
             continue;
         }
 
@@ -163,13 +168,16 @@ fn highlight_slash_comment(line: &str, keywords: &[&str]) -> String {
                 if c == '\'' {
                     break;
                 }
+
                 if c == '\\' {
                     if let Some(n) = chars.next() {
                         out.push(n);
                     }
                 }
             }
+
             out.push_str("\x1b[0m");
+
             continue;
         }
 
@@ -183,7 +191,9 @@ fn highlight_slash_comment(line: &str, keywords: &[&str]) -> String {
                     break;
                 }
             }
+
             push_keyword_or_ident(&mut out, &ident, keywords);
+            
             continue;
         }
         out.push(ch);

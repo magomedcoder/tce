@@ -122,7 +122,6 @@ pub struct Texts {
     pub tip_agent_busy: &'static str,
     pub tip_assistant_answer_inserted: &'static str,
     pub tip_open_file_first: &'static str,
-    pub tip_rust_diagnostics_rs_only: &'static str,
     pub tip_failed_run_rustc: &'static str,
     pub tip_rust_check_no_diagnostics: &'static str,
     pub tip_rust_diagnostics_ready: &'static str,

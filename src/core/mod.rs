@@ -1,7 +1,9 @@
 pub mod buffer;
 pub mod document;
 pub mod keys;
+pub mod lifecycle;
 pub mod plugin;
+pub mod plugin_context;
 pub mod recents;
 pub mod session;
 pub mod settings;

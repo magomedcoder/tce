@@ -45,30 +45,41 @@ impl WorkspacePlugin for LlmPlugin {
             ws.plugin_handle_agent_unsafe_confirm_key(key);
             return true;
         }
+        
         if ws.plugin_is_llm_prompt_active() {
             ws.plugin_handle_llm_prompt_key(key);
             return true;
         }
+
         if ws.plugin_is_multi_edit_active() {
             ws.plugin_handle_multi_edit_key(key);
             return true;
         }
+
         if ws.plugin_is_sync_edit_active() {
             ws.plugin_handle_sync_edit_key(key);
             return true;
         }
+
         if ws.plugin_is_llm_history_view_active() {
             ws.plugin_handle_llm_history_view_key(key);
             return true;
         }
+
         if ws.plugin_is_agent_events_view_active() {
             ws.plugin_handle_agent_events_view_key(key);
+            return true;
+        }
+
+        if ws.plugin_is_right_panel_focused() {
+            ws.plugin_handle_right_panel_key(key);
             return true;
         }
 
         if !ws.is_llm_enabled_in_settings() {
             return false;
         }
+
         match key {
             Key::CtrlG => {
                 ws.open_llm_prompt();

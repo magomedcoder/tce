@@ -3,7 +3,8 @@ use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-use crate::core::keys::read_key;
+use crate::core::keys::{read_ui_event, UiEvent};
+use crate::core::lifecycle::{CorePhase, PhaseTransition, RenderingPrimitives};
 use crate::core::terminal::RawMode;
 use crate::plugins::core_ui::welcome::{Welcome, WelcomeAction};
 use crate::workspace::Workspace;
@@ -46,7 +47,7 @@ impl App {
         let _raw = RawMode::enable_stdin()?;
         let stdin_fd = std::io::stdin().as_raw_fd();
 
-        write!(io::stdout(), "\x1b[?25l\x1b[?7l")?;
+        write!(io::stdout(), "{}", RenderingPrimitives::ENTER)?;
         io::stdout().flush()?;
 
         let result = (|| -> io::Result<()> {
@@ -54,9 +55,10 @@ impl App {
                 match &mut self.phase {
                     Phase::Welcome(w) => {
                         w.render()?;
-                        let key = match read_key(stdin_fd)? {
-                            Some(k) => k,
+                        let key = match read_ui_event(stdin_fd)? {
                             None => continue,
+                            Some(UiEvent::Mouse(_)) => continue,
+                            Some(UiEvent::Key(k)) => k,
                         };
 
                         match w.handle_key(key)? {
@@ -71,13 +73,18 @@ impl App {
                     }
                     Phase::Workspace(ws) => {
                         ws.render()?;
-                        let key = match read_key(stdin_fd)? {
-                            Some(k) => k,
+                        match read_ui_event(stdin_fd)? {
                             None => continue,
-                        };
-
-                        if ws.handle_key(key)? {
-                            break;
+                            Some(UiEvent::Mouse(m)) => {
+                                if ws.handle_mouse(m)? {
+                                    break;
+                                }
+                            }
+                            Some(UiEvent::Key(k)) => {
+                                if ws.handle_key(k)? {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -85,9 +92,47 @@ impl App {
             Ok(())
         })();
 
-        write!(io::stdout(), "\x1b[?25h\x1b[?7h\x1b[m\r\n")?;
+        write!(io::stdout(), "{}", RenderingPrimitives::LEAVE)?;
         io::stdout().flush()?;
 
         result
+    }
+}
+
+impl CorePhase for Workspace {
+    fn render(&mut self) -> io::Result<()> {
+        Workspace::render(self)
+    }
+
+    fn handle_key(&mut self, key: crate::core::keys::Key) -> io::Result<PhaseTransition> {
+        if Workspace::handle_key(self, key)? {
+            Ok(PhaseTransition::Quit)
+        } else {
+            Ok(PhaseTransition::Stay)
+        }
+    }
+
+    fn handle_mouse(
+        &mut self,
+        mouse: crate::core::keys::MouseEvent,
+    ) -> io::Result<PhaseTransition> {
+        if Workspace::handle_mouse(self, mouse)? {
+            Ok(PhaseTransition::Quit)
+        } else {
+            Ok(PhaseTransition::Stay)
+        }
+    }
+}
+
+impl CorePhase for Welcome {
+    fn render(&mut self) -> io::Result<()> {
+        Welcome::render(self)
+    }
+
+    fn handle_key(&mut self, key: crate::core::keys::Key) -> io::Result<PhaseTransition> {
+        match Welcome::handle_key(self, key)? {
+            WelcomeAction::Quit => Ok(PhaseTransition::Quit),
+            WelcomeAction::OpenProject(_, _) | WelcomeAction::None => Ok(PhaseTransition::Stay),
+        }
     }
 }

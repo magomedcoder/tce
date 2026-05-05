@@ -33,6 +33,14 @@ pub trait WorkspacePlugin {
     ) -> bool {
         false
     }
+    fn postprocess_editor_line(
+        &self,
+        _ws: &Workspace,
+        _line_idx: usize,
+        rendered: String,
+    ) -> String {
+        rendered
+    }
 }
 
 pub struct PluginRegistry {
@@ -90,5 +98,17 @@ impl PluginRegistry {
             }
         }
         false
+    }
+
+    pub fn postprocess_editor_line(
+        &self,
+        ws: &Workspace,
+        line_idx: usize,
+        mut rendered: String,
+    ) -> String {
+        for plugin in &self.plugins {
+            rendered = plugin.postprocess_editor_line(ws, line_idx, rendered);
+        }
+        rendered
     }
 }

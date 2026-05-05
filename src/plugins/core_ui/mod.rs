@@ -17,6 +17,7 @@ const TOGGLE_PIN: &str = "toggle_pin";
 const SHOW_HELP: &str = "show_help";
 const LANGUAGE_PICKER: &str = "language_picker";
 const LSP_WAVE_EXTENSIONS: &str = "lsp_wave_extensions";
+const MANAGE_PLUGINS: &str = "manage_plugins";
 
 pub struct CoreUiPlugin;
 
@@ -40,6 +41,7 @@ impl WorkspacePlugin for CoreUiPlugin {
             PaletteCommand::new(tx.show_hotkeys.to_string(), SHOW_HELP),
             PaletteCommand::new(tx.language_picker.to_string(), LANGUAGE_PICKER),
             PaletteCommand::new(tx.lsp_wave.to_string(), LSP_WAVE_EXTENSIONS),
+            PaletteCommand::new("Plugins: Manage".to_string(), MANAGE_PLUGINS),
         ]
     }
 
@@ -57,19 +59,54 @@ impl WorkspacePlugin for CoreUiPlugin {
             SHOW_HELP => ws.plugin_show_hotkeys_help(),
             LANGUAGE_PICKER => ws.plugin_open_language_picker(),
             LSP_WAVE_EXTENSIONS => ws.plugin_show_lsp_wave_extensions(),
+            MANAGE_PLUGINS => ws.plugin_open_plugin_manager(),
             _ => return false,
         }
         true
     }
 
     fn handle_key(&self, ws: &mut Workspace, key: Key) -> bool {
+        if ws.plugin_is_plugin_manager_active() {
+            ws.plugin_handle_plugin_manager_key(key);
+            return true;
+        }
+        
+        if ws.plugin_is_completion_active() {
+            ws.plugin_handle_completion_key(key);
+            return true;
+        }
+
+        if ws.plugin_is_command_palette_active() {
+            ws.plugin_handle_command_palette_key(key);
+            return true;
+        }
+
+        if ws.plugin_is_tabs_focused() {
+            ws.plugin_handle_tabs_key(key);
+            return true;
+        }
+
         match key {
+            Key::CtrlS => ws.plugin_save_active_document(),
             Key::CtrlB => ws.plugin_toggle_sidebar(),
             Key::CtrlR => ws.plugin_toggle_right_panel(),
             Key::CtrlL => ws.plugin_open_language_picker(),
             Key::CtrlH => ws.plugin_show_hotkeys_help(),
+            Key::CtrlJ if !ws.plugin_is_tabs_focused() => ws.plugin_open_command_palette(),
+            Key::CtrlP => ws.plugin_next_tab(),
+            Key::CtrlU => ws.plugin_prev_tab(),
+            Key::CtrlW => ws.plugin_close_active_tab(),
+            Key::CtrlX => ws.plugin_toggle_pin_active_tab(),
+            Key::CtrlArrowLeft if ws.plugin_is_tabs_focused() => ws.plugin_move_tab_left(),
+            Key::CtrlArrowRight if ws.plugin_is_tabs_focused() => ws.plugin_move_tab_right(),
+            Key::ShiftTab => ws.plugin_focus_prev(),
+            Key::Tab => ws.plugin_focus_next(),
             _ => return false,
         }
         true
+    }
+
+    fn render_overlay(&self, ws: &Workspace, out: &mut String, cols: usize, rows: usize) -> bool {
+        ws.plugin_render_core_ui_overlays(out, cols, rows)
     }
 }

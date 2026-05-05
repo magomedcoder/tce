@@ -17,6 +17,14 @@ struct Snapshot {
     selection: Option<SelectionRange>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EditKind {
+    InsertChar,
+    InsertTab,
+    Backspace,
+    Delete,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectionRange {
     pub start_row: usize,
@@ -36,11 +44,162 @@ pub struct Document {
     pub pinned: bool,
     pub force_quit_pending: bool,
     selection: Option<SelectionRange>,
+    selection_history: Vec<SelectionRange>,
     undo_stack: Vec<Snapshot>,
     redo_stack: Vec<Snapshot>,
+    /// После прокрутки колесом вертикальная подгонка `scroll_row` к курсору отключена, пока пользователь снова не двигает курсор с клавиатуры или не кликнет
+    vertical_scroll_detached: bool,
+    last_edit_kind: Option<EditKind>,
 }
 
 impl Document {
+    fn is_pair(open: char, close: char) -> bool {
+        matches!(
+            (open, close),
+            ('(', ')') | ('{', '}') | ('[', ']') | ('"', '"') | ('\'', '\'')
+        )
+    }
+
+    fn line_char_at(&self, row: usize, col: usize) -> Option<char> {
+        self.buffer.lines().get(row).and_then(|line| line.chars().nth(col))
+    }
+
+    fn smart_backspace_indent(&mut self, tab_size: usize, insert_spaces: bool) -> Option<(usize, usize)> {
+        if !insert_spaces || self.col == 0 {
+            return None;
+        }
+
+        let line = self.buffer.lines().get(self.row)?;
+        if !line.chars().take(self.col).all(|ch| ch == ' ') {
+            return None;
+        }
+
+        let step = tab_size.max(1);
+        let to_delete = self.col % step;
+        let delete_count = if to_delete == 0 { step } else { to_delete };
+        let mut pos = (self.row, self.col);
+        for _ in 0..delete_count {
+            if let Some(next) = self.buffer.backspace(pos.0, pos.1) {
+                pos = next;
+            } else {
+                break;
+            }
+        }
+        Some(pos)
+    }
+
+    fn smart_backspace_pair(&mut self) -> Option<(usize, usize)> {
+        if self.col == 0 {
+            return None;
+        }
+        let prev = self.line_char_at(self.row, self.col.saturating_sub(1))?;
+        let next = self.line_char_at(self.row, self.col)?;
+        if !Self::is_pair(prev, next) {
+            return None;
+        }
+
+        let (r, c) = self.buffer.backspace(self.row, self.col)?;
+        let (r, c) = self.buffer.delete_forward(r, c)?;
+        Some((r, c))
+    }
+
+    fn smart_delete_pair(&mut self) -> Option<(usize, usize)> {
+        let cur = self.line_char_at(self.row, self.col)?;
+        let next = self.line_char_at(self.row, self.col + 1)?;
+        if !Self::is_pair(cur, next) {
+            return None;
+        }
+
+        let (r, c) = self.buffer.delete_forward(self.row, self.col)?;
+        let (r, c) = self.buffer.delete_forward(r, c)?;
+        Some((r, c))
+    }
+
+    fn duplicate_current_line(&mut self) -> bool {
+        let mut lines = self.buffer.lines().to_vec();
+        if self.row >= lines.len() {
+            return false;
+        }
+
+        let line = lines[self.row].clone();
+        lines.insert(self.row + 1, line);
+        self.buffer = Buffer::from_file(&lines.join("\n"));
+        self.row = (self.row + 1).min(self.buffer.line_count().saturating_sub(1));
+        self.col = self.col.min(self.buffer.line_len_chars(self.row));
+        true
+    }
+
+    fn move_current_line_up(&mut self) -> bool {
+        if self.row == 0 {
+            return false;
+        }
+
+        let mut lines = self.buffer.lines().to_vec();
+        if self.row >= lines.len() {
+            return false;
+        }
+
+        lines.swap(self.row - 1, self.row);
+        self.buffer = Buffer::from_file(&lines.join("\n"));
+        self.row -= 1;
+        self.col = self.col.min(self.buffer.line_len_chars(self.row));
+        true
+    }
+
+    fn move_current_line_down(&mut self) -> bool {
+        let mut lines = self.buffer.lines().to_vec();
+        if self.row + 1 >= lines.len() {
+            return false;
+        }
+
+        lines.swap(self.row, self.row + 1);
+        self.buffer = Buffer::from_file(&lines.join("\n"));
+        self.row += 1;
+        self.col = self.col.min(self.buffer.line_len_chars(self.row));
+        true
+    }
+
+    fn auto_pair_for(ch: char) -> Option<char> {
+        match ch {
+            '(' => Some(')'),
+            '{' => Some('}'),
+            '[' => Some(']'),
+            '"' => Some('"'),
+            '\'' => Some('\''),
+            _ => None,
+        }
+    }
+
+    fn insert_char_with_auto_pair(&mut self, ch: char) {
+        let (r, c) = self.buffer.insert_char(self.row, self.col, ch);
+        self.row = r;
+        self.col = c;
+        if let Some(closing) = Self::auto_pair_for(ch) {
+            let original_row = self.row;
+            let original_col = self.col;
+            let (_r2, _c2) = self.buffer.insert_char(self.row, self.col, closing);
+            self.row = original_row;
+            self.col = original_col;
+        }
+        self.dirty = true;
+    }
+
+    fn insert_tab(&mut self, tab_size: usize, insert_spaces: bool) {
+        if insert_spaces {
+            let spaces = " ".repeat(tab_size.max(1));
+            for ch in spaces.chars() {
+                let (r, c) = self.buffer.insert_char(self.row, self.col, ch);
+                self.row = r;
+                self.col = c;
+            }
+        } else {
+            let (r, c) = self.buffer.insert_char(self.row, self.col, '\t');
+            self.row = r;
+            self.col = c;
+        }
+        self.dirty = true;
+    }
+
     pub fn empty() -> Self {
         Self {
             buffer: Buffer::new(),
@@ -53,8 +212,11 @@ impl Document {
             pinned: false,
             force_quit_pending: false,
             selection: None,
+            selection_history: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            vertical_scroll_detached: false,
+            last_edit_kind: None,
         }
     }
 
@@ -71,8 +233,11 @@ impl Document {
             pinned: false,
             force_quit_pending: false,
             selection: None,
+            selection_history: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            vertical_scroll_detached: false,
+            last_edit_kind: None,
         })
     }
 
@@ -88,8 +253,11 @@ impl Document {
             pinned: false,
             force_quit_pending: false,
             selection: None,
+            selection_history: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            vertical_scroll_detached: false,
+            last_edit_kind: None,
         }
     }
 
@@ -113,6 +281,8 @@ impl Document {
         self.hscroll = snap.hscroll;
         self.dirty = snap.dirty;
         self.selection = snap.selection;
+        self.vertical_scroll_detached = false;
+        self.last_edit_kind = None;
         self.clamp_cursor();
     }
 
@@ -132,7 +302,19 @@ impl Document {
         self.redo_stack.clear();
     }
 
+    fn begin_grouped_edit(&mut self, kind: EditKind) {
+        if self.last_edit_kind != Some(kind) {
+            self.push_undo_snapshot();
+        }
+        self.last_edit_kind = Some(kind);
+    }
+
+    fn break_edit_group(&mut self) {
+        self.last_edit_kind = None;
+    }
+
     fn undo(&mut self) {
+        self.last_edit_kind = None;
         let Some(prev) = self.undo_stack.pop() else {
             return;
         };
@@ -142,6 +324,7 @@ impl Document {
     }
 
     fn redo(&mut self) {
+        self.last_edit_kind = None;
         let Some(next) = self.redo_stack.pop() else {
             return;
         };
@@ -180,12 +363,14 @@ impl Document {
             return;
         }
 
-        if self.row < self.scroll_row {
-            self.scroll_row = self.row;
-        }
+        if !self.vertical_scroll_detached {
+            if self.row < self.scroll_row {
+                self.scroll_row = self.row;
+            }
 
-        if self.row >= self.scroll_row + content_h {
-            self.scroll_row = self.row + 1 - content_h;
+            if self.row >= self.scroll_row + content_h {
+                self.scroll_row = self.row + 1 - content_h;
+            }
         }
 
         let w = editor_width.max(1);
@@ -196,6 +381,21 @@ impl Document {
         if self.col >= self.hscroll + w {
             self.hscroll = self.col + 1 - w;
         }
+    }
+
+    /// Прокрутка только вьюпорта; `row`/`col` не меняются. Шаг задаётся событием колеса
+    pub fn scroll_viewport_lines(&mut self, delta: isize, viewport_h: usize) {
+        let n = self.buffer.line_count().max(1);
+        let vh = viewport_h.max(1);
+        let max_scroll = if n > vh { n - vh } else { 0 };
+        let cur = self.scroll_row as isize + delta;
+        self.scroll_row = cur.clamp(0, max_scroll as isize) as usize;
+        self.vertical_scroll_detached = true;
+    }
+
+    /// Выключает режим «колесо сдвинуло viewport без привязки к курсору» (клавиатура, клик)
+    pub fn clear_vertical_scroll_detachment(&mut self) {
+        self.vertical_scroll_detached = false;
     }
 
     /// Одна строка текста для окна редактора (ширина `max_chars`)
@@ -222,6 +422,7 @@ impl Document {
         if text.is_empty() {
             return;
         }
+        self.break_edit_group();
 
         if self.replace_selection_with_text(text) {
             return;
@@ -252,6 +453,154 @@ impl Document {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.selection_history.clear();
+    }
+
+    fn is_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+
+    fn select_word_at_cursor(&mut self) -> bool {
+        let Some(line) = self.buffer.lines().get(self.row) else {
+            return false;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            return false;
+        }
+
+        let len = chars.len();
+        let mut pos = self.col.min(len.saturating_sub(1));
+        if !Self::is_word_char(chars[pos]) && pos > 0 && Self::is_word_char(chars[pos - 1]) {
+            pos -= 1;
+        }
+        if !Self::is_word_char(chars[pos]) {
+            return false;
+        }
+
+        let mut start = pos;
+        while start > 0 && Self::is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = pos + 1;
+        while end < len && Self::is_word_char(chars[end]) {
+            end += 1;
+        }
+
+        self.selection = Some(SelectionRange {
+            start_row: self.row,
+            start_col: start,
+            end_row: self.row,
+            end_col: end,
+        });
+        true
+    }
+
+    fn move_word_left(&mut self) {
+        if self.col == 0 {
+            if self.row == 0 {
+                return;
+            }
+
+            self.row -= 1;
+            self.col = self.buffer.line_len_chars(self.row);
+        }
+
+        let Some(line) = self.buffer.lines().get(self.row) else {
+            return;
+        };
+
+        let chars: Vec<char> = line.chars().collect();
+        if chars.is_empty() {
+            self.col = 0;
+            return;
+        }
+
+        let mut i = self.col.min(chars.len());
+        while i > 0 && !Self::is_word_char(chars[i - 1]) {
+            i -= 1;
+        }
+
+        while i > 0 && Self::is_word_char(chars[i - 1]) {
+            i -= 1;
+        }
+
+        self.col = i;
+    }
+
+    fn move_word_right(&mut self) {
+        let len = self.buffer.line_len_chars(self.row);
+        if self.col >= len {
+            if self.row + 1 < self.buffer.line_count() {
+                self.row += 1;
+                self.col = 0;
+            }
+            return;
+        }
+
+        let Some(line) = self.buffer.lines().get(self.row) else {
+            return;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = self.col.min(chars.len());
+
+        if i < chars.len() && Self::is_word_char(chars[i]) {
+            while i < chars.len() && Self::is_word_char(chars[i]) {
+                i += 1;
+            }
+        }
+
+        while i < chars.len() && !Self::is_word_char(chars[i]) {
+            i += 1;
+        }
+
+        self.col = i;
+    }
+
+    pub fn expand_selection(&mut self) -> bool {
+        let current = self.selection.clone();
+        match current {
+            None => self.select_word_at_cursor(),
+            Some(sel) => {
+                self.selection_history.push(sel.clone());
+                let line_len = self.buffer.line_len_chars(sel.start_row);
+                if sel.start_row == sel.end_row && !(sel.start_col == 0 && sel.end_col == line_len) {
+                    self.selection = Some(SelectionRange {
+                        start_row: sel.start_row,
+                        start_col: 0,
+                        end_row: sel.end_row,
+                        end_col: line_len,
+                    });
+                    true
+                } else {
+                    let last_row = self.buffer.line_count().saturating_sub(1);
+                    let last_col = self.buffer.line_len_chars(last_row);
+                    if sel.start_row == 0 && sel.start_col == 0 && sel.end_row == last_row && sel.end_col == last_col {
+                        false
+                    } else {
+                        self.selection = Some(SelectionRange {
+                            start_row: 0,
+                            start_col: 0,
+                            end_row: last_row,
+                            end_col: last_col,
+                        });
+                        true
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn shrink_selection(&mut self) -> bool {
+        if let Some(prev) = self.selection_history.pop() {
+            self.selection = Some(prev);
+            true
+        } else if self.selection.is_some() {
+            self.selection = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn replace_selection_with_text(&mut self, text: &str) -> bool {
@@ -294,7 +643,8 @@ impl Document {
     }
 
     /// `true` = завершить приложение
-    pub fn handle_key(&mut self, key: Key) -> io::Result<bool> {
+    pub fn handle_key_with_config(&mut self, key: Key, tab_size: usize, insert_spaces: bool) -> io::Result<bool> {
+        self.vertical_scroll_detached = false;
         match key {
             Key::CtrlQ => {
                 if self.dirty && !self.force_quit_pending {
@@ -305,22 +655,44 @@ impl Document {
                 return Ok(true);
             }
             Key::CtrlS => {
+                self.break_edit_group();
                 self.save()?;
             }
             Key::CtrlC => {
+                self.break_edit_group();
                 self.undo();
             }
             Key::CtrlV => {
+                self.break_edit_group();
                 self.redo();
             }
-            Key::Char(ch) => {
+            Key::CtrlK => {
+                self.break_edit_group();
                 self.push_undo_snapshot();
-                let (r, c) = self.buffer.insert_char(self.row, self.col, ch);
-                self.row = r;
-                self.col = c;
-                self.dirty = true;
+                if self.duplicate_current_line() {
+                    self.dirty = true;
+                }
+            }
+            Key::CtrlO => {
+                self.break_edit_group();
+                self.push_undo_snapshot();
+                if self.move_current_line_up() {
+                    self.dirty = true;
+                }
+            }
+            Key::CtrlN => {
+                self.break_edit_group();
+                self.push_undo_snapshot();
+                if self.move_current_line_down() {
+                    self.dirty = true;
+                }
+            }
+            Key::Char(ch) => {
+                self.begin_grouped_edit(EditKind::InsertChar);
+                self.insert_char_with_auto_pair(ch);
             }
             Key::Enter => {
+                self.break_edit_group();
                 self.push_undo_snapshot();
                 let (r, c) = self.buffer.insert_char(self.row, self.col, '\n');
                 self.row = r;
@@ -328,29 +700,34 @@ impl Document {
                 self.dirty = true;
             }
             Key::Tab => {
-                self.push_undo_snapshot();
-                let (r, c) = self.buffer.insert_char(self.row, self.col, '\t');
-                self.row = r;
-                self.col = c;
-                self.dirty = true;
+                self.begin_grouped_edit(EditKind::InsertTab);
+                self.insert_tab(tab_size, insert_spaces);
             }
             Key::Backspace => {
-                self.push_undo_snapshot();
-                if let Some((r, c)) = self.buffer.backspace(self.row, self.col) {
+                self.begin_grouped_edit(EditKind::Backspace);
+                if let Some((r, c)) = self
+                    .smart_backspace_pair()
+                    .or_else(|| self.smart_backspace_indent(tab_size, insert_spaces))
+                    .or_else(|| self.buffer.backspace(self.row, self.col))
+                {
                     self.row = r;
                     self.col = c;
                     self.dirty = true;
                 }
             }
             Key::Delete => {
-                self.push_undo_snapshot();
-                if let Some((r, c)) = self.buffer.delete_forward(self.row, self.col) {
+                self.begin_grouped_edit(EditKind::Delete);
+                if let Some((r, c)) = self
+                    .smart_delete_pair()
+                    .or_else(|| self.buffer.delete_forward(self.row, self.col))
+                {
                     self.row = r;
                     self.col = c;
                     self.dirty = true;
                 }
             }
             Key::ArrowLeft => {
+                self.break_edit_group();
                 if self.col > 0 {
                     self.col -= 1;
                 } else if self.row > 0 {
@@ -359,6 +736,7 @@ impl Document {
                 }
             }
             Key::ArrowRight => {
+                self.break_edit_group();
                 let len = self.buffer.line_len_chars(self.row);
                 if self.col < len {
                     self.col += 1;
@@ -368,27 +746,53 @@ impl Document {
                 }
             }
             Key::ArrowUp => {
+                self.break_edit_group();
                 if self.row > 0 {
                     self.row -= 1;
                     self.col = self.col.min(self.buffer.line_len_chars(self.row));
                 }
             }
             Key::ArrowDown => {
+                self.break_edit_group();
                 if self.row + 1 < self.buffer.line_count() {
                     self.row += 1;
                     self.col = self.col.min(self.buffer.line_len_chars(self.row));
                 }
             }
-            Key::Home => self.col = 0,
-            Key::End => self.col = self.buffer.line_len_chars(self.row),
+            Key::Home => {
+                self.break_edit_group();
+                self.col = 0;
+            }
+            Key::End => {
+                self.break_edit_group();
+                self.col = self.buffer.line_len_chars(self.row);
+            }
             Key::PageUp => {
+                self.break_edit_group();
                 let step = content_height();
                 self.row = self.row.saturating_sub(step);
             }
             Key::PageDown => {
+                self.break_edit_group();
                 let step = content_height();
                 self.row = (self.row + step).min(self.buffer.line_count().saturating_sub(1));
                 self.col = self.col.min(self.buffer.line_len_chars(self.row));
+            }
+            Key::CtrlArrowUp => {
+                self.break_edit_group();
+                let _ = self.expand_selection();
+            }
+            Key::CtrlArrowDown => {
+                self.break_edit_group();
+                let _ = self.shrink_selection();
+            }
+            Key::CtrlArrowLeft => {
+                self.break_edit_group();
+                self.move_word_left();
+            }
+            Key::CtrlArrowRight => {
+                self.break_edit_group();
+                self.move_word_right();
             }
             Key::Esc
             | Key::ShiftTab
@@ -404,23 +808,19 @@ impl Document {
             | Key::CtrlL
             | Key::CtrlJ
             | Key::CtrlH
-            | Key::CtrlK
-            | Key::CtrlN
-            | Key::CtrlO
             | Key::CtrlU
             | Key::CtrlW
             | Key::CtrlP
             | Key::CtrlX
             | Key::CtrlZ
-            | Key::CtrlArrowLeft
-            | Key::CtrlArrowRight
-            | Key::CtrlArrowUp
-            | Key::CtrlArrowDown
-            | Key::CtrlBackslash => {}
+            | Key::CtrlBackslash => {
+                self.break_edit_group();
+            }
         }
         self.force_quit_pending = false;
         Ok(false)
     }
+
 }
 
 fn normalize_selection(
@@ -495,6 +895,7 @@ fn content_height() -> usize {
 mod tests {
     use super::Document;
     use crate::core::buffer::Buffer;
+    use crate::core::keys::Key;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -534,5 +935,157 @@ mod tests {
         assert_eq!(saved, "hello");
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opening_bracket_inserts_pair_and_keeps_cursor_inside() {
+        let mut doc = Document::empty();
+        doc.handle_key_with_config(Key::Char('('), 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "()");
+        assert_eq!(doc.row, 0);
+        assert_eq!(doc.col, 1);
+    }
+
+    #[test]
+    fn quote_inserts_pair_and_keeps_cursor_inside() {
+        let mut doc = Document::empty();
+        doc.handle_key_with_config(Key::Char('"'), 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "\"\"");
+        assert_eq!(doc.row, 0);
+        assert_eq!(doc.col, 1);
+    }
+
+    #[test]
+    fn backspace_between_pair_removes_both_chars() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("()");
+        doc.row = 0;
+        doc.col = 1;
+
+        doc.handle_key_with_config(Key::Backspace, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "");
+        assert_eq!(doc.col, 0);
+    }
+
+    #[test]
+    fn delete_on_opening_pair_removes_both_chars() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("[]");
+        doc.row = 0;
+        doc.col = 0;
+
+        doc.handle_key_with_config(Key::Delete, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "");
+        assert_eq!(doc.col, 0);
+    }
+
+    #[test]
+    fn backspace_in_indentation_deletes_to_tab_stop() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("        x");
+        doc.row = 0;
+        doc.col = 8;
+
+        doc.handle_key_with_config(Key::Backspace, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "    x");
+        assert_eq!(doc.col, 4);
+    }
+
+    #[test]
+    fn ctrl_k_duplicates_current_line() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("a\nb");
+        doc.row = 0;
+        doc.col = 1;
+
+        doc.handle_key_with_config(Key::CtrlK, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "a\na\nb");
+        assert_eq!(doc.row, 1);
+    }
+
+    #[test]
+    fn ctrl_o_moves_line_up() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("one\ntwo\nthree");
+        doc.row = 1;
+        doc.col = 2;
+
+        doc.handle_key_with_config(Key::CtrlO, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "two\none\nthree");
+        assert_eq!(doc.row, 0);
+    }
+
+    #[test]
+    fn ctrl_n_moves_line_down() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("one\ntwo\nthree");
+        doc.row = 1;
+        doc.col = 1;
+
+        doc.handle_key_with_config(Key::CtrlN, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "one\nthree\ntwo");
+        assert_eq!(doc.row, 2);
+    }
+
+    #[test]
+    fn sequential_typing_is_grouped_into_single_undo_step() {
+        let mut doc = Document::empty();
+        doc.handle_key_with_config(Key::Char('a'), 4, true).expect("key handling should work");
+        doc.handle_key_with_config(Key::Char('b'), 4, true).expect("key handling should work");
+        doc.handle_key_with_config(Key::Char('c'), 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "abc");
+
+        doc.handle_key_with_config(Key::CtrlC, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "");
+    }
+
+    #[test]
+    fn cursor_move_breaks_edit_group_for_undo() {
+        let mut doc = Document::empty();
+        doc.handle_key_with_config(Key::Char('a'), 4, true).expect("key handling should work");
+        doc.handle_key_with_config(Key::Char('b'), 4, true).expect("key handling should work");
+        doc.handle_key_with_config(Key::ArrowLeft, 4, true).expect("key handling should work");
+        doc.handle_key_with_config(Key::Char('x'), 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "axb");
+
+        doc.handle_key_with_config(Key::CtrlC, 4, true).expect("key handling should work");
+        assert_eq!(doc.buffer.to_file_string(), "ab");
+    }
+
+    #[test]
+    fn expand_and_shrink_selection_cycle() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("alpha beta");
+        doc.row = 0;
+        doc.col = 1;
+
+        doc.handle_key_with_config(Key::CtrlArrowUp, 4, true).expect("key handling should work");
+        let sel1 = doc.selection.clone().expect("word selection");
+        assert_eq!((sel1.start_col, sel1.end_col), (0, 5));
+
+        doc.handle_key_with_config(Key::CtrlArrowUp, 4, true).expect("key handling should work");
+        let sel2 = doc.selection.clone().expect("line selection");
+        assert_eq!((sel2.start_col, sel2.end_col), (0, 10));
+
+        doc.handle_key_with_config(Key::CtrlArrowDown, 4, true).expect("key handling should work");
+        let sel3 = doc.selection.clone().expect("shrunk selection");
+        assert_eq!((sel3.start_col, sel3.end_col), (0, 5));
+
+        doc.handle_key_with_config(Key::CtrlArrowDown, 4, true).expect("key handling should work");
+        assert!(doc.selection.is_none());
+    }
+
+    #[test]
+    fn ctrl_word_jump_supports_utf8_words() {
+        let mut doc = Document::empty();
+        doc.buffer = Buffer::from_file("привет мир");
+        doc.row = 0;
+        doc.col = 0;
+
+        doc.handle_key_with_config(Key::CtrlArrowRight, 4, true).expect("key handling should work");
+        assert_eq!(doc.col, 7);
+
+        doc.handle_key_with_config(Key::CtrlArrowLeft, 4, true).expect("key handling should work");
+        assert_eq!(doc.col, 0);
     }
 }

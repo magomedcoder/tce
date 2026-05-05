@@ -10,7 +10,7 @@ use crate::plugins::llm::agent_orchestrator::AgentOrchestrator;
 use crate::plugins::llm::agent_sandbox::AgentSandbox;
 use crate::plugins::llm::agent_tools::AgentToolExecutor;
 use crate::core::document::Document;
-use crate::core::keys::Key;
+use crate::core::keys::{Key, MouseEvent, MouseEventKind};
 use crate::localization::{texts, Language};
 use crate::core::recents;
 use crate::core::session;
@@ -24,9 +24,25 @@ use crate::plugins::llm::llm_api::{
     TceLlmClient,
 };
 use crate::plugins;
+use crate::plugins::code_quality::{
+    DiagnosticItem, 
+    DiagnosticSeverity, 
+    DiagnosticsFilter, 
+    DiagnosticsState, 
+    apply_quick_fix_to_line,
+    infer_inlay_hint,
+};
+use crate::plugins::code_quality::highlights::{
+    apply_quality_highlights, 
+    find_brace_scope_range, 
+    find_matching_bracket_pair
+};
+use crate::plugins::code_quality::lint::LintEngine;
+use crate::plugins::code_quality::syntax;
 use crate::plugins::filesystem::{self as filetree, TreeEntry};
+use crate::plugins::manifest::PluginManifest;
 use crate::core::buffer::Buffer;
-use crate::plugins::languages;
+use crate::core::plugin_context::PluginContext;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Focus {
@@ -68,6 +84,8 @@ pub struct Workspace {
     multi_edit: Option<MultiEditState>,
     sync_edit: Option<SyncEditState>,
     command_palette: Option<CommandPaletteState>,
+    completion: Option<CompletionState>,
+    plugin_manager: Option<PluginManagerState>,
     diagnostics: Option<DiagnosticsState>,
     git_view: Option<GitViewState>,
     nav_back: Vec<NavLocation>,
@@ -79,6 +97,8 @@ pub struct Workspace {
     font_zoom: i8,
     line_spacing: bool,
     ligatures: bool,
+    tab_size: usize,
+    insert_spaces: bool,
     llm_health_checked: bool,
     llm_history: Vec<LlmHistoryEntry>,
     agent_events: Vec<String>,
@@ -86,6 +106,7 @@ pub struct Workspace {
     llm_inflight: Option<LlmInFlight>,
     agent_inflight: Option<AgentInFlight>,
     agent_allow_unsafe_tools: bool,
+    mouse_drag_anchor: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -200,6 +221,8 @@ struct SymbolJumpState {
 #[derive(Clone, Debug, Default)]
 struct GoToLineState {
     input: String,
+    origin_row: usize,
+    origin_col: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -262,6 +285,7 @@ struct SyncEditState {
     replacement: String,
     original_text: String,
     occurrences: usize,
+    active_occurrences: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,45 +301,17 @@ struct CommandPaletteState {
     sel: usize,
 }
 
-#[derive(Clone, Debug)]
-struct DiagnosticItem {
-    path: PathBuf,
-    row: usize,
-    col: usize,
-    message: String,
-    severity: DiagnosticSeverity,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiagnosticSeverity {
-    Error,
-    Warning,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiagnosticsFilter {
-    All,
-    Errors,
-    Warnings,
-}
-
-#[derive(Clone, Debug)]
-struct DiagnosticsState {
-    items: Vec<DiagnosticItem>,
+#[derive(Clone, Debug, Default)]
+struct CompletionState {
+    prefix: String,
+    items: Vec<String>,
     sel: usize,
-    open: bool,
-    filter: DiagnosticsFilter,
 }
 
-impl Default for DiagnosticsState {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            sel: 0,
-            open: false,
-            filter: DiagnosticsFilter::All,
-        }
-    }
+#[derive(Clone, Debug, Default)]
+struct PluginManagerState {
+    items: Vec<PluginManifest>,
+    sel: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -328,7 +324,29 @@ struct GitViewState {
     cursor: usize,
 }
 
+/// Геометрия основной области (в терминальных координатах строка 1 - вкладки)
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct ContentLayout {
+    rows: usize,
+    cols: usize,
+    content_h: usize,
+    line_stride: usize,
+    logical_content_h: usize,
+    sidebar_w: usize,
+    sidebar_on: bool,
+    right_panel_w: usize,
+    right_panel_on: bool,
+    editor_w: usize,
+    gutter_w: usize,
+    editor_text_w: usize,
+}
+
 impl Workspace {
+    pub(crate) fn plugin_context(&mut self) -> PluginContext<'_> {
+        PluginContext::new(self)
+    }
+
     fn doc(&self) -> &Document {
         self.docs.get(self.active_doc).or_else(|| self.docs.first()).expect("workspace always keeps at least one document")
     }
@@ -342,6 +360,200 @@ impl Workspace {
         }
 
         &mut self.docs[self.active_doc]
+    }
+
+    fn content_layout(&self, size: TermSize) -> ContentLayout {
+        let rows = size.rows.max(1) as usize;
+        let cols = size.cols.max(1) as usize;
+        let tabs_h = 1usize;
+        let content_h = rows.saturating_sub(1 + tabs_h).max(1);
+        let line_stride = if self.line_spacing { 2usize } else { 1usize };
+        let logical_content_h = (content_h / line_stride).max(1);
+        let sidebar_w = Self::sidebar_width_cols(cols);
+        let sidebar_on = self.sidebar_visible && cols > sidebar_w + 4;
+        let right_panel_w = Self::right_panel_width_cols(cols);
+        let llm_enabled = Self::llm_enabled_in_settings();
+        let right_panel_on = llm_enabled && self.right_panel_visible && cols > right_panel_w + 8;
+        let editor_w = Self::editor_width(cols, sidebar_on, right_panel_on);
+        let gutter_w = self.editor_gutter_width();
+        let editor_text_w = self.editor_text_width(editor_w.saturating_sub(gutter_w).max(1));
+        ContentLayout {
+            rows,
+            cols,
+            content_h,
+            line_stride,
+            logical_content_h,
+            sidebar_w,
+            sidebar_on,
+            right_panel_w,
+            right_panel_on,
+            editor_w,
+            gutter_w,
+            editor_text_w,
+        }
+    }
+
+    /// Строка/колонка буфера из координат CSI (1-based) в области редактора, либо `None`
+    fn editor_pos_from_term_xy(&self, layout: &ContentLayout, tc: u32, tr: u32) -> Option<(usize, usize)> {
+        let max_tr = (1 + layout.content_h).min(layout.rows) as u32;
+        if tr < 2 || tr > max_tr {
+            return None;
+        }
+        
+        if layout.sidebar_on && tc <= layout.sidebar_w as u32 {
+            return None;
+        }
+
+        let editor_left = if layout.sidebar_on {
+            layout.sidebar_w as u32 + 2
+        } else {
+            1
+        };
+
+        let editor_right = editor_left.saturating_add(layout.editor_w as u32).saturating_sub(1);
+        if tc < editor_left || tc > editor_right {
+            return None;
+        }
+
+        let phy = (tr - 2) as usize;
+        let logical_row = phy / layout.line_stride;
+        if logical_row >= layout.logical_content_h {
+            return None;
+        }
+
+        let doc = self.doc();
+        let line_idx = doc
+            .scroll_row
+            .saturating_add(logical_row)
+            .min(doc.buffer.line_count().saturating_sub(1));
+
+        let col_off = if layout.sidebar_on && layout.cols > layout.sidebar_w + 4 {
+            (layout.sidebar_w as u32) + 2 + layout.gutter_w as u32
+        } else {
+            layout.gutter_w as u32
+        };
+
+        // Обратная к `cursor_screen_pos`: `tc = col_off + (col - hscroll) + 1`
+        let text0 = col_off.saturating_add(1);
+        let line_len = doc.buffer.line_len_chars(line_idx);
+        let col = if tc < text0 {
+            0usize
+        } else {
+            let rel = (tc as usize).saturating_sub(col_off as usize).saturating_sub(1);
+            doc.hscroll.saturating_add(rel).min(line_len)
+        };
+
+        Some((line_idx, col))
+    }
+
+    fn sidebar_index_from_term_xy(&self, layout: &ContentLayout, tc: u32, tr: u32) -> Option<usize> {
+        if !layout.sidebar_on || tc > layout.sidebar_w as u32 {
+            return None;
+        }
+
+        let max_tr = (1 + layout.content_h).min(layout.rows) as u32;
+        if tr < 2 || tr > max_tr {
+            return None;
+        }
+
+        let phy = (tr - 2) as usize;
+        let logical_row = phy / layout.line_stride;
+        let idx = self.tree_scroll.saturating_add(logical_row);
+        (idx < self.tree.len()).then_some(idx)
+    }
+
+    /// Обработка мыши: колесо и ЛКМ в редакторе/сайдбаре. `true` - выйти из приложения
+    pub fn handle_mouse(&mut self, ev: MouseEvent) -> io::Result<bool> {
+        if self.hotkeys_help || self.language_picker {
+            return Ok(false);
+        }
+
+        if self.command_palette.is_some()
+            || self.go_to_line.is_some()
+            || self.quick_open.is_some()
+            || self.in_file_find.is_some()
+            || self.project_search.is_some()
+            || self.symbol_jump.is_some()
+            || self.llm_prompt.is_some()
+            || self.multi_edit.is_some()
+            || self.sync_edit.is_some()
+            || self.llm_history_view.is_some()
+            || self.agent_events_view.is_some()
+            || self.diagnostics.as_ref().is_some_and(|d| d.open)
+            || self.git_view.is_some()
+        {
+            return Ok(false);
+        }
+
+        let size = winsize_tty().unwrap_or(TermSize { rows: 24, cols: 80 });
+        let layout = self.content_layout(size);
+
+        match ev.kind {
+            MouseEventKind::WheelUp | MouseEventKind::WheelDown => {
+                if self.focus != Focus::Editor {
+                    return Ok(false);
+                }
+
+                if self.editor_pos_from_term_xy(&layout, ev.column, ev.row).is_none() {
+                    return Ok(false);
+                }
+
+                let delta = if matches!(ev.kind, MouseEventKind::WheelUp) {
+                    -3
+                } else {
+                    3
+                };
+
+                // Политика: только сдвиг viewport, позиция курсора в буфере не меняется (вертикальная «привязка» к курсору отключена через `vertical_scroll_detached`)
+                self.doc_mut().scroll_viewport_lines(delta, layout.logical_content_h);
+                Ok(false)
+            }
+
+            MouseEventKind::LeftPress => {
+                self.mouse_drag_anchor = None;
+                if let Some(idx) = self.sidebar_index_from_term_xy(&layout, ev.column, ev.row) {
+                    self.focus = Focus::Sidebar;
+                    self.tree_sel = idx;
+                    return Ok(false);
+                }
+
+                if let Some((line, col)) = self.editor_pos_from_term_xy(&layout, ev.column, ev.row) {
+                    self.focus = Focus::Editor;
+                    let doc = self.doc_mut();
+                    doc.clear_vertical_scroll_detachment();
+                    doc.row = line;
+                    doc.col = col;
+                    doc.clamp_cursor();
+                    doc.set_selection(line, col, line, col);
+                    self.mouse_drag_anchor = Some((line, col));
+                }
+
+                Ok(false)
+            }
+
+            MouseEventKind::LeftDrag => {
+                let Some((anchor_row, anchor_col)) = self.mouse_drag_anchor else {
+                    return Ok(false);
+                };
+                let Some((line, col)) = self.editor_pos_from_term_xy(&layout, ev.column, ev.row) else {
+                    return Ok(false);
+                };
+                let doc = self.doc_mut();
+                doc.clear_vertical_scroll_detachment();
+                doc.row = line;
+                doc.col = col;
+                doc.clamp_cursor();
+                doc.set_selection(anchor_row, anchor_col, line, col);
+                Ok(false)
+            }
+
+            MouseEventKind::Release => {
+                self.mouse_drag_anchor = None;
+                Ok(false)
+            }
+
+            _ => Ok(false),
+        }
     }
 
     pub fn open_project(root: PathBuf) -> io::Result<Self> {
@@ -413,6 +625,8 @@ impl Workspace {
             multi_edit: None,
             sync_edit: None,
             command_palette: None,
+            completion: None,
+            plugin_manager: None,
             diagnostics: None,
             git_view: None,
             nav_back: Vec::new(),
@@ -424,6 +638,8 @@ impl Workspace {
             font_zoom: app_settings.font_zoom,
             line_spacing: app_settings.line_spacing,
             ligatures: app_settings.ligatures,
+            tab_size: app_settings.tab_size,
+            insert_spaces: app_settings.insert_spaces,
             llm_health_checked: false,
             llm_history: Vec::new(),
             agent_events: Vec::new(),
@@ -431,6 +647,7 @@ impl Workspace {
             llm_inflight: None,
             agent_inflight: None,
             agent_allow_unsafe_tools: false,
+            mouse_drag_anchor: None,
         })
     }
 
@@ -499,7 +716,19 @@ impl Workspace {
         s.font_zoom = self.font_zoom;
         s.line_spacing = self.line_spacing;
         s.ligatures = self.ligatures;
+        s.tab_size = self.tab_size;
+        s.insert_spaces = self.insert_spaces;
         s.language = self.language;
+        let _ = settings::save_settings(&s);
+    }
+
+    fn set_plugin_enabled_state(&mut self, plugin_id: &str, enabled: bool) {
+        let mut s = settings::load_settings();
+        if enabled {
+            s.disabled_plugins.retain(|id| id != plugin_id);
+        } else if !s.disabled_plugins.iter().any(|id| id == plugin_id) {
+            s.disabled_plugins.push(plugin_id.to_string());
+        }
         let _ = settings::save_settings(&s);
     }
 
@@ -609,6 +838,19 @@ impl Workspace {
         let right_panel_on = llm_enabled && self.right_panel_visible && cols > right_panel_w + 8;
         let editor_w = Self::editor_width(cols, sidebar_on, right_panel_on);
         let gutter_w = self.editor_gutter_width();
+        let in_file_matches = self.in_file_find_matches();
+        let in_file_query = self
+            .in_file_find
+            .as_ref()
+            .map(|s| s.query.clone())
+            .unwrap_or_default();
+        let in_file_selected = self
+            .in_file_find
+            .as_ref()
+            .and_then(|s| in_file_matches.get(s.sel.min(in_file_matches.len().saturating_sub(1))))
+            .copied();
+        let bracket_pair = find_matching_bracket_pair(self.doc());
+        let scope_range = find_brace_scope_range(self.doc());
 
         self.doc_mut().adjust_scroll(logical_content_h, editor_w.max(1));
         self.adjust_tree_scroll(logical_content_h);
@@ -648,15 +890,54 @@ impl Workspace {
             let text = doc.editor_line_display(line_idx, editor_text_w);
             let clipped_raw: String = text.chars().take(editor_text_w).collect();
             let clipped_raw = apply_ligatures(&clipped_raw, self.ligatures);
-            let clipped = languages::syntax_highlight_line(doc.path.as_ref(), &clipped_raw);
+            let syntax_or_find = if !in_file_query.is_empty() {
+                let selected_col = in_file_selected
+                    .filter(|(r, _)| *r == line_idx)
+                    .map(|(_, c)| c.saturating_sub(doc.hscroll));
+                highlight_in_file_matches_ansi(
+                    &clipped_raw,
+                    &in_file_query,
+                    selected_col,
+                )
+            } else {
+                syntax::syntax_highlight_line(doc.path.as_ref(), &clipped_raw)
+            };
+            let full_line = doc.buffer.lines().get(line_idx).map(|s| s.as_str()).unwrap_or("");
+            let clipped = apply_quality_highlights(
+                &syntax_or_find,
+                &clipped_raw,
+                full_line,
+                line_idx,
+                doc.hscroll,
+                &bracket_pair,
+                scope_range,
+                line_idx == doc.row,
+            );
+            let inlay: Option<String> = doc
+                .buffer
+                .lines()
+                .get(line_idx)
+                .and_then(|line| infer_inlay_hint(line))
+                .filter(|hint| clipped_raw.chars().count() + hint.chars().count() <= editor_text_w);
 
             if line_idx == doc.row {
                 editor_line.push_str(self.current_line_bg());
                 editor_line.push_str(&clipped);
+                if let Some(hint) = inlay {
+                    editor_line.push_str("\x1b[90m");
+                    editor_line.push_str(&hint);
+                    editor_line.push_str("\x1b[0m");
+                }
                 editor_line.push_str("\x1b[0m");
             } else {
                 editor_line.push_str(&clipped);
+                if let Some(hint) = inlay {
+                    editor_line.push_str("\x1b[90m");
+                    editor_line.push_str(&hint);
+                    editor_line.push_str("\x1b[0m");
+                }
             }
+            editor_line = plugins::builtin_registry().postprocess_editor_line(self, line_idx, editor_line);
 
             if sidebar_on {
                 let line = self.sidebar_line(logical_row, sidebar_w);
@@ -724,6 +1005,8 @@ impl Workspace {
 
         if self.go_to_line.is_some() {
             self.render_go_to_line_overlay(&mut out, cols, rows);
+        } else if self.completion.is_some() {
+            self.render_completion_overlay(&mut out, cols, rows);
         } else if self.command_palette.is_some() {
             self.render_command_palette_overlay(&mut out, cols, rows);
         } else if plugins::builtin_registry().render_overlay(self, &mut out, cols, rows) {
@@ -731,6 +1014,7 @@ impl Workspace {
         }
 
         let (sr, sc) = self.cursor_screen_pos(content_h, cols, sidebar_w, right_panel_on, right_panel_w);
+        out.push_str("\x1b[?25h");
         out.push_str(&format!("\x1b[{};{}H", sr, sc));
 
         let mut stdout = io::stdout().lock();
@@ -792,7 +1076,7 @@ impl Workspace {
         }
 
         if let Some(state) = &self.go_to_line {
-            let prompt = format!("Go to line: {}", state.input);
+            let prompt = format!("Go to line[:col]: {}", state.input);
             let col = prompt.chars().count().saturating_add(1) as u32;
             return (rows_to_u32(content_h + 2), col.max(1));
         }
@@ -957,7 +1241,7 @@ impl Workspace {
                 Key::CtrlH => {
                     self.hotkeys_help = false;
                 }
-                Key::CtrlQ => return self.doc_mut().handle_key(key),
+                Key::CtrlQ => return self.handle_doc_key(key),
                 _ => {}
             }
             return Ok(false);
@@ -983,7 +1267,7 @@ impl Workspace {
                 Key::CtrlL => {
                     self.language_picker = false;
                 }
-                Key::CtrlQ => return self.doc_mut().handle_key(key),
+                Key::CtrlQ => return self.handle_doc_key(key),
                 _ => {}
             }
             return Ok(false);
@@ -1004,18 +1288,8 @@ impl Workspace {
             return Ok(false);
         }
 
-        if self.command_palette.is_some() {
-            self.handle_command_palette_key(key);
-            return Ok(false);
-        }
-
         if matches!(key, Key::CtrlQ) {
-            return self.doc_mut().handle_key(key);
-        }
-
-        if matches!(key, Key::CtrlS) {
-            self.doc_mut().save()?;
-            return Ok(false);
+            return self.handle_doc_key(key);
         }
 
         if plugins::builtin_registry().handle_key(self, key) {
@@ -1023,93 +1297,8 @@ impl Workspace {
             return Ok(false);
         }
 
-        if matches!(key, Key::CtrlA) {
-            self.navigate_back();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlZ) {
-            self.navigate_forward();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlP) {
-            self.next_tab();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlU) {
-            self.prev_tab();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlW) {
-            self.close_active_tab();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlX) {
-            self.toggle_pin_active_tab();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlD) {
-            let target = self.word_under_cursor();
-            if target.is_empty() {
-                self.tip = Some(texts(self.language).tip_no_word_under_cursor.to_string());
-            } else {
-                self.multi_edit = Some(MultiEditState {
-                    target,
-                    replacement: String::new(),
-                });
-            }
-
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlE) {
-            self.start_sync_edit();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::CtrlJ) && self.focus != Focus::Tabs {
-            self.command_palette = Some(CommandPaletteState::default());
-            return Ok(false);
-        }
-
-        if self.focus == Focus::Editor && self.docs.len() >= 2 {
-            if matches!(key, Key::CtrlArrowLeft) {
-                self.move_tab_left(self.active_doc);
-                return Ok(false);
-            }
-
-            if matches!(key, Key::CtrlArrowRight) {
-                self.move_tab_right(self.active_doc);
-                return Ok(false);
-            }
-        }
-
-        if matches!(key, Key::ShiftTab) {
-            self.focus_prev();
-            return Ok(false);
-        }
-
-        if matches!(key, Key::Tab) {
-            self.focus_next();
-            return Ok(false);
-        }
-
-        if self.focus == Focus::RightPanel {
-            self.handle_right_panel_key(key);
-            return Ok(false);
-        }
-
-        if self.focus == Focus::Tabs {
-            self.handle_tabs_key(key);
-            return Ok(false);
-        }
-
-        self.doc_mut().handle_key(key)?;
+        self.handle_doc_key(key)?;
+        self.post_editor_key_update(key);
         if self.autosave_on_edit && is_edit_key(key) {
             let should_save = self.doc().dirty && self.doc().path.is_some();
             if should_save {
@@ -1122,6 +1311,30 @@ impl Workspace {
         }
         plugins::builtin_registry().post_handle_key(self, key);
         Ok(false)
+    }
+
+    fn post_editor_key_update(&mut self, key: Key) {
+        match key {
+            Key::Char(ch) => {
+                self.refresh_completion_from_cursor();
+                if ch == '(' {
+                    self.show_signature_help_hint();
+                }
+            }
+            Key::Backspace => {
+                self.refresh_completion_from_cursor();
+            }
+            _ => {
+                self.completion = None;
+            }
+        }
+    }
+
+    fn handle_doc_key(&mut self, key: Key) -> io::Result<bool> {
+        let tab_size = self.tab_size;
+        let insert_spaces = self.insert_spaces;
+        self.doc_mut()
+            .handle_key_with_config(key, tab_size, insert_spaces)
     }
 
     fn handle_sidebar_key(&mut self, key: Key) {
@@ -2002,6 +2215,7 @@ impl Workspace {
                     st.query.pop();
                     st.sel = 0;
                 }
+                self.preview_in_file_find_selection();
                 return;
             }
             Key::Char(ch) => {
@@ -2009,6 +2223,7 @@ impl Workspace {
                     st.query.push(ch);
                     st.sel = 0;
                 }
+                self.preview_in_file_find_selection();
                 return;
             }
             _ => {}
@@ -2023,6 +2238,7 @@ impl Workspace {
                     }
                     st.sel = (st.sel + 1) % matches.len();
                 }
+                self.preview_in_file_find_selection();
             }
             Key::ShiftTab | Key::ArrowUp => {
                 if let Some(st) = self.in_file_find.as_mut() {
@@ -2031,16 +2247,19 @@ impl Workspace {
                     }
                     st.sel = st.sel.checked_sub(1).unwrap_or(matches.len().saturating_sub(1));
                 }
+                self.preview_in_file_find_selection();
             }
             Key::Home => {
                 if let Some(st) = self.in_file_find.as_mut() {
                     st.sel = 0;
                 }
+                self.preview_in_file_find_selection();
             }
             Key::End => {
                 if let Some(st) = self.in_file_find.as_mut() {
                     st.sel = matches.len().saturating_sub(1);
                 }
+                self.preview_in_file_find_selection();
             }
             Key::Enter => {
                 if matches.is_empty() {
@@ -2067,6 +2286,20 @@ impl Workspace {
             }
             _ => {}
         }
+    }
+
+    fn preview_in_file_find_selection(&mut self) {
+        let matches = self.in_file_find_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let idx = self
+            .in_file_find
+            .as_ref()
+            .map(|s| s.sel.min(matches.len().saturating_sub(1)))
+            .unwrap_or(0);
+        let (row, col) = matches[idx];
+        self.jump_in_active_doc(row, col, true);
     }
 
     fn in_file_find_matches(&self) -> Vec<(usize, usize)> {
@@ -2529,24 +2762,39 @@ impl Workspace {
         };
         match key {
             Key::Esc | Key::CtrlY => {
+                let origin_row = state.origin_row;
+                let origin_col = state.origin_col;
+                self.jump_in_active_doc(origin_row, origin_col, false);
                 self.go_to_line = None;
             }
             Key::Backspace => {
                 state.input.pop();
+                self.preview_go_to_line_target();
             }
             Key::Char(ch) => {
-                if ch.is_ascii_digit() {
+                if ch.is_ascii_digit() || ch == ':' {
                     state.input.push(ch);
+                    self.preview_go_to_line_target();
                 }
             }
             Key::Enter => {
-                let line = state.input.trim().parse::<usize>().ok().unwrap_or(1);
-                let target = line.saturating_sub(1);
-                self.jump_in_active_doc(target, 0, true);
+                let (target_row, target_col) = parse_line_col_input(&state.input).unwrap_or((0, 0));
+                self.jump_in_active_doc(target_row, target_col, true);
                 self.go_to_line = None;
             }
             _ => {}
         }
+    }
+
+    fn preview_go_to_line_target(&mut self) {
+        let Some(state) = self.go_to_line.as_ref() else {
+            return;
+        };
+        let Some((row, col)) = parse_line_col_input(&state.input) else {
+            self.jump_in_active_doc(state.origin_row, state.origin_col, false);
+            return;
+        };
+        self.jump_in_active_doc(row, col, false);
     }
 
     fn handle_llm_prompt_key(&mut self, key: Key) {
@@ -2682,6 +2930,7 @@ impl Workspace {
             target,
             original_text,
             occurrences,
+            active_occurrences: 1,
         });
     }
 
@@ -2703,6 +2952,12 @@ impl Workspace {
                 self.sync_edit = None;
                 self.doc_mut().dirty = true;
             }
+            Key::CtrlD => {
+                if state.active_occurrences < state.occurrences {
+                    state.active_occurrences += 1;
+                    self.apply_sync_edit_preview();
+                }
+            }
             Key::Backspace => {
                 state.replacement.pop();
                 self.apply_sync_edit_preview();
@@ -2722,12 +2977,152 @@ impl Workspace {
         let Some(re) = whole_word_regex(&state.target) else {
             return;
         };
-        let replaced = re
-            .replace_all(&state.original_text, state.replacement.as_str())
-            .to_string();
+        let mut replaced = String::with_capacity(state.original_text.len());
+        let mut last_end = 0usize;
+        let mut seen = 0usize;
+        for m in re.find_iter(&state.original_text) {
+            replaced.push_str(&state.original_text[last_end..m.start()]);
+            if seen < state.active_occurrences {
+                replaced.push_str(&state.replacement);
+            } else {
+                replaced.push_str(m.as_str());
+            }
+            last_end = m.end();
+            seen += 1;
+        }
+        replaced.push_str(&state.original_text[last_end..]);
         let doc = self.doc_mut();
         doc.buffer = Buffer::from_file(&replaced);
         doc.clamp_cursor();
+    }
+
+    fn handle_completion_key(&mut self, key: Key) {
+        let Some(state) = self.completion.as_mut() else {
+            return;
+        };
+        match key {
+            Key::Esc => {
+                self.completion = None;
+            }
+            Key::ArrowUp => {
+                state.sel = state.sel.saturating_sub(1);
+            }
+            Key::ArrowDown => {
+                if !state.items.is_empty() {
+                    state.sel = (state.sel + 1).min(state.items.len().saturating_sub(1));
+                }
+            }
+            Key::Tab | Key::Enter => {
+                let picked = state
+                    .items
+                    .get(state.sel.min(state.items.len().saturating_sub(1)))
+                    .cloned();
+                self.completion = None;
+                if let Some(item) = picked {
+                    self.apply_completion_item(&item);
+                }
+            }
+            _ => {
+                self.completion = None;
+            }
+        }
+    }
+
+    fn apply_completion_item(&mut self, item: &str) {
+        let prefix = self.current_word_prefix();
+        if prefix.is_empty() || item == prefix {
+            return;
+        }
+        let suffix: String = item.chars().skip(prefix.chars().count()).collect();
+        self.doc_mut().insert_text(&suffix);
+    }
+
+    fn refresh_completion_from_cursor(&mut self) {
+        let prefix = self.current_word_prefix();
+        if prefix.chars().count() < 2 {
+            self.completion = None;
+            return;
+        }
+        let items = self.collect_completion_candidates(&prefix);
+        if items.is_empty() {
+            self.completion = None;
+            return;
+        }
+        self.completion = Some(CompletionState {
+            prefix,
+            items,
+            sel: 0,
+        });
+    }
+
+    fn current_word_prefix(&self) -> String {
+        let doc = self.doc();
+        let Some(line) = doc.buffer.lines().get(doc.row) else {
+            return String::new();
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = doc.col.min(chars.len());
+        while i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            i -= 1;
+        }
+        chars[i..doc.col.min(chars.len())].iter().collect()
+    }
+
+    fn collect_completion_candidates(&self, prefix: &str) -> Vec<String> {
+        use std::collections::BTreeSet;
+        let p = prefix.to_lowercase();
+        let mut uniq = BTreeSet::<String>::new();
+        for line in self.doc().buffer.lines() {
+            let mut cur = String::new();
+            for ch in line.chars() {
+                if ch.is_alphanumeric() || ch == '_' {
+                    cur.push(ch);
+                } else if cur.chars().count() >= 2 {
+                    if cur.to_lowercase().starts_with(&p) && cur != prefix {
+                        let _ = uniq.insert(cur.clone());
+                    }
+                    cur.clear();
+                } else {
+                    cur.clear();
+                }
+            }
+            if cur.chars().count() >= 2 && cur.to_lowercase().starts_with(&p) && cur != prefix {
+                let _ = uniq.insert(cur);
+            }
+        }
+        uniq.into_iter().take(8).collect()
+    }
+
+    fn show_signature_help_hint(&mut self) {
+        let doc = self.doc();
+        let Some(line) = doc.buffer.lines().get(doc.row) else {
+            return;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = doc.col.saturating_sub(1);
+        
+        while i > 0 && chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i -= 1;
+        }
+
+        while i > 0 && chars.get(i).is_some_and(|c| *c == '(') {
+            i -= 1;
+        }
+
+        let mut end = i + 1;
+        while end > 0 && chars.get(end - 1).is_some_and(|c| c.is_whitespace()) {
+            end -= 1;
+        }
+
+        let mut start = end;
+        while start > 0 && chars.get(start - 1).is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == ':') {
+            start -= 1;
+        }
+
+        if start < end {
+            let name: String = chars[start..end].iter().collect();
+            self.tip = Some(format!("Signature help: {}(…)", name));
+        }
     }
 
     fn command_palette_items(&self) -> Vec<(String, String)> {
@@ -2822,6 +3217,56 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn plugin_open_plugin_manager(&mut self) {
+        self.open_plugin_manager();
+    }
+
+    pub(crate) fn plugin_is_completion_active(&self) -> bool {
+        self.completion.is_some()
+    }
+
+    pub(crate) fn plugin_handle_completion_key(&mut self, key: Key) {
+        self.handle_completion_key(key);
+    }
+
+    pub(crate) fn plugin_is_command_palette_active(&self) -> bool {
+        self.command_palette.is_some()
+    }
+
+    pub(crate) fn plugin_handle_command_palette_key(&mut self, key: Key) {
+        self.handle_command_palette_key(key);
+    }
+
+    pub(crate) fn plugin_start_multi_edit_from_cursor(&mut self) {
+        let target = self.word_under_cursor();
+        if target.is_empty() {
+            self.tip = Some(texts(self.language).tip_no_word_under_cursor.to_string());
+        } else {
+            self.multi_edit = Some(MultiEditState {
+                target,
+                replacement: String::new(),
+            });
+        }
+    }
+
+    pub(crate) fn plugin_start_sync_edit(&mut self) {
+        self.start_sync_edit();
+    }
+
+    pub(crate) fn plugin_navigate_back(&mut self) {
+        self.navigate_back();
+    }
+
+    pub(crate) fn plugin_navigate_forward(&mut self) {
+        self.navigate_forward();
+    }
+
+    pub(crate) fn plugin_save_active_document(&mut self) {
+        if let Err(err) = self.doc_mut().save() {
+            self.tip = Some(format!("{}: {err}", texts(self.language).error_prefix));
+        }
+    }
+
     pub(crate) fn plugin_toggle_right_panel(&mut self) {
         if Self::llm_enabled_in_settings() {
             self.right_panel_visible = !self.right_panel_visible;
@@ -2891,8 +3336,80 @@ impl Workspace {
         self.toggle_pin_active_tab();
     }
 
+    pub(crate) fn plugin_next_tab(&mut self) {
+        self.next_tab();
+    }
+
+    pub(crate) fn plugin_prev_tab(&mut self) {
+        self.prev_tab();
+    }
+
+    pub(crate) fn plugin_close_active_tab(&mut self) {
+        self.close_active_tab();
+    }
+
+    pub(crate) fn plugin_is_tabs_focused(&self) -> bool {
+        self.focus == Focus::Tabs
+    }
+
+    pub(crate) fn plugin_move_tab_left(&mut self) {
+        if self.focus == Focus::Tabs && self.docs.len() >= 2 {
+            self.move_tab_left(self.tab_sel);
+        }
+    }
+
+    pub(crate) fn plugin_move_tab_right(&mut self) {
+        if self.focus == Focus::Tabs && self.docs.len() >= 2 {
+            self.move_tab_right(self.tab_sel);
+        }
+    }
+
+    pub(crate) fn plugin_run_task_build(&mut self) {
+        self.run_project_task("build", &["build"]);
+    }
+
+    pub(crate) fn plugin_run_task_test(&mut self) {
+        self.run_project_task("test", &["test"]);
+    }
+
+    pub(crate) fn plugin_run_task_run(&mut self) {
+        self.run_project_task("run", &["run"]);
+    }
+
+    pub(crate) fn plugin_handle_tabs_key(&mut self, key: Key) {
+        self.handle_tabs_key(key);
+    }
+
+    pub(crate) fn plugin_is_right_panel_focused(&self) -> bool {
+        self.focus == Focus::RightPanel
+    }
+
+    pub(crate) fn plugin_handle_right_panel_key(&mut self, key: Key) {
+        self.handle_right_panel_key(key);
+    }
+
     pub(crate) fn plugin_show_hotkeys_help(&mut self) {
         self.hotkeys_help = true;
+    }
+
+    pub(crate) fn plugin_focus_prev(&mut self) {
+        self.focus_prev();
+    }
+
+    pub(crate) fn plugin_focus_next(&mut self) {
+        self.focus_next();
+    }
+
+    pub(crate) fn plugin_open_command_palette(&mut self) {
+        self.command_palette = Some(CommandPaletteState::default());
+    }
+
+    pub(crate) fn plugin_is_plugin_manager_active(&self) -> bool {
+        self.plugin_manager.is_some()
+    }
+
+    pub(crate) fn plugin_handle_plugin_manager_key(&mut self, key: Key) {
+        self.handle_plugin_manager_key(key);
     }
 
     pub(crate) fn plugin_open_language_picker(&mut self) {
@@ -2905,11 +3422,11 @@ impl Workspace {
             .doc()
             .path
             .as_deref()
-            .is_some_and(languages::is_first_wave_path);
+            .is_some_and(syntax::is_first_wave_path);
         self.tip = Some(
             texts(self.language)
                 .tip_lsp_wave_fmt
-                .replacen("{}", &languages::FIRST_WAVE_EXTENSIONS.join(", "), 1)
+                .replacen("{}", &syntax::FIRST_WAVE_EXTENSIONS.join(", "), 1)
                 .replacen(
                     "{}",
                     if cur { texts(self.language).yes } else { texts(self.language).no },
@@ -2930,16 +3447,44 @@ impl Workspace {
         self.quick_open = Some(QuickOpenState::default());
     }
 
+    fn open_plugin_manager(&mut self) {
+        self.plugin_manager = Some(PluginManagerState {
+            items: plugins::manifest::discover_manifests(),
+            sel: 0,
+        });
+    }
+
     pub(crate) fn open_project_search(&mut self) {
         self.project_search = Some(ProjectSearchState::default());
+    }
+
+    pub(crate) fn open_project_search_seeded(&mut self, query: String, regex_mode: bool) {
+        self.project_search = Some(ProjectSearchState {
+            query,
+            replacement: String::new(),
+            sel: 0,
+            edit_replacement: false,
+            regex_mode,
+            confirm_replace_all: false,
+        });
     }
 
     pub(crate) fn open_symbol_jump(&mut self) {
         self.symbol_jump = Some(SymbolJumpState::default());
     }
 
+    pub(crate) fn open_symbol_jump_seeded(&mut self, query: String) {
+        self.symbol_jump = Some(SymbolJumpState { query, sel: 0 });
+    }
+
     pub(crate) fn open_go_to_line(&mut self) {
-        self.go_to_line = Some(GoToLineState::default());
+        let origin_row = self.doc().row;
+        let origin_col = self.doc().col;
+        self.go_to_line = Some(GoToLineState {
+            input: String::new(),
+            origin_row,
+            origin_col,
+        });
     }
 
     pub(crate) fn open_in_file_find_seeded(&mut self) {
@@ -2953,6 +3498,72 @@ impl Workspace {
             query: seed,
             sel: 0,
         });
+    }
+
+    pub(crate) fn plugin_lsp_hover(&mut self) {
+        let word = self.word_under_cursor();
+        if word.is_empty() {
+            self.tip = Some("LSP hover: no symbol under cursor".to_string());
+            return;
+        }
+
+        let row = self.doc().row.saturating_add(1);
+        let line = self
+            .doc()
+            .buffer
+            .lines()
+            .get(self.doc().row)
+            .cloned()
+            .unwrap_or_default();
+        self.tip = Some(format!(
+            "LSP hover: `{}` at line {} | {}",
+            word,
+            row,
+            truncate_str(line.trim(), 80)
+        ));
+    }
+
+    pub(crate) fn plugin_lsp_go_to_definition(&mut self) {
+        let word = self.word_under_cursor();
+        if word.is_empty() {
+            self.tip = Some("LSP definition: no symbol under cursor".to_string());
+            return;
+        }
+
+        self.open_symbol_jump_seeded(word.clone());
+        let matches = self.symbol_jump_matches();
+        if let Some(first) = matches.first() {
+            self.jump_to_path_position(first.path.clone(), first.line_idx, 0, true);
+            self.symbol_jump = None;
+            self.tip = Some(format!("LSP definition: jumped to `{}`", word));
+        } else {
+            self.tip = Some(format!("LSP definition: no match for `{}`", word));
+        }
+    }
+
+    pub(crate) fn plugin_lsp_references(&mut self) {
+        let word = self.word_under_cursor();
+        if word.is_empty() {
+            self.tip = Some("LSP references: no symbol under cursor".to_string());
+            return;
+        }
+
+        let query = format!(r"\b{}\b", regex::escape(&word));
+        self.open_project_search_seeded(query, true);
+    }
+
+    pub(crate) fn plugin_lsp_rename_symbol(&mut self) {
+        self.start_sync_edit();
+    }
+
+    pub(crate) fn plugin_lsp_code_actions(&mut self) {
+        let word = self.word_under_cursor();
+        if word.is_empty() {
+            self.tip = Some("LSP code actions: no quick fixes".to_string());
+            return;
+        }
+
+        self.tip = Some(format!("LSP code actions: available for `{}` -> rename symbol / find references", word));
     }
 
     pub(crate) fn plugin_open_git_status(&mut self) {
@@ -3026,6 +3637,14 @@ impl Workspace {
 
     pub(crate) fn plugin_run_agent_loop_mvp(&mut self) {
         self.run_agent_loop_mvp();
+    }
+
+    pub(crate) fn plugin_render_core_ui_overlays(&self, out: &mut String, cols: usize, rows: usize) -> bool {
+        if self.plugin_manager.is_some() {
+            self.render_plugin_manager_overlay(out, cols, rows);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn plugin_render_assistant_overlays(
@@ -3624,55 +4243,14 @@ impl Workspace {
             self.tip = Some(texts(self.language).tip_open_file_first.to_string());
             return;
         };
-
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            self.tip = Some(texts(self.language).tip_rust_diagnostics_rs_only.to_string());
-            return;
-        }
-        let output = Command::new("rustc")
-            .arg("--error-format=short")
-            .arg("--emit=metadata")
-            .arg(&path)
-            .output();
-
-        let Ok(output) = output else {
-            self.tip = Some(texts(self.language).tip_failed_run_rustc.to_string());
-            return;
+        let engine = LintEngine::new();
+        let items: Vec<DiagnosticItem> = match engine.run_for_path(&path) {
+            Ok(items) => items,
+            Err(_) => {
+                self.tip = Some(texts(self.language).tip_failed_run_rustc.to_string());
+                return;
+            }
         };
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut items = Vec::<DiagnosticItem>::new();
-
-        for line in stderr.lines() {
-            let mut parts = line.splitn(4, ':');
-            let p0 = parts.next().unwrap_or_default().trim();
-            let p1 = parts.next().unwrap_or_default().trim();
-            let p2 = parts.next().unwrap_or_default().trim();
-            let p3 = parts.next().unwrap_or_default().trim();
-            if p0.is_empty() || p1.is_empty() || p2.is_empty() || p3.is_empty() {
-                continue;
-            }
-
-            let line_num = p1.parse::<usize>().ok().unwrap_or(1).saturating_sub(1);
-            let col_num = p2.parse::<usize>().ok().unwrap_or(1).saturating_sub(1);
-            let diag_path = PathBuf::from(p0);
-            if !diag_path.exists() {
-                continue;
-            }
-
-            let severity = if p3.to_lowercase().contains("warning") {
-                DiagnosticSeverity::Warning
-            } else {
-                DiagnosticSeverity::Error
-            };
-
-            items.push(DiagnosticItem {
-                path: diag_path,
-                row: line_num,
-                col: col_num,
-                message: p3.to_string(),
-                severity,
-            });
-        }
 
         if items.is_empty() {
             self.tip = Some(texts(self.language).tip_rust_check_no_diagnostics.to_string());
@@ -3769,8 +4347,61 @@ impl Workspace {
                 self.jump_to_path_position(item.path, item.row, item.col, true);
                 self.diagnostics = None;
             }
+            Key::Char('x') | Key::Char('X') => {
+                let items = self.diagnostics_visible_items();
+                if items.is_empty() {
+                    return;
+                }
+
+                let idx = self
+                    .diagnostics
+                    .as_ref()
+                    .map(|s| s.sel.min(items.len().saturating_sub(1)))
+                    .unwrap_or(0);
+                let item = items[idx].clone();
+
+                if self.apply_diagnostic_quick_fix(&item) {
+                    if let Some(state) = self.diagnostics.as_mut() {
+                        state.items.retain(|d| {
+                            !(d.path == item.path && d.row == item.row && d.col == item.col && d.message == item.message)
+                        });
+                        state.sel = state.sel.min(state.items.len().saturating_sub(1));
+                    }
+                    self.tip = Some("Applied diagnostic quick fix".to_string());
+                } else {
+                    self.tip = Some("No automatic quick fix available".to_string());
+                }
+            }
             _ => {}
         }
+    }
+
+    fn apply_diagnostic_quick_fix(&mut self, item: &DiagnosticItem) -> bool {
+        let active_path = self.doc().path.clone();
+        if active_path.as_ref() != Some(&item.path) {
+            return false;
+        }
+
+        let row = item.row;
+        let msg = item.message.clone();
+        let doc = self.doc_mut();
+        let Some(line) = doc.buffer.lines().get(row).cloned() else {
+            return false;
+        };
+        let Some(next_line) = apply_quick_fix_to_line(&line, &msg) else {
+            return false;
+        };
+
+        if next_line == line {
+            return false;
+        }
+
+        let mut lines = doc.buffer.lines().to_vec();
+        lines[row] = next_line;
+        doc.buffer = Buffer::from_file(&lines.join("\n"));
+        doc.dirty = true;
+        doc.clamp_cursor();
+        true
     }
 
     fn open_git_output(&mut self, title: &str, args: &[&str]) {
@@ -3804,6 +4435,24 @@ impl Workspace {
             scroll: 0,
             cursor: 0,
         });
+    }
+
+    fn run_project_task(&mut self, profile: &str, args: &[&str]) {
+        let out = match Command::new("cargo").current_dir(&self.project_root).args(args).output() {
+            Ok(o) => o,
+            Err(e) => {
+                self.tip = Some(format!("{}: {e}", texts(self.language).error_prefix));
+                return;
+            }
+        };
+
+        if out.status.success() {
+            self.tip = Some(format!("Task `{profile}` completed"));
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let first = stderr.lines().next().unwrap_or("unknown error");
+            self.tip = Some(format!("Task `{profile}` failed: {first}"));
+        }
     }
 
     fn handle_git_view_key(&mut self, key: Key) {
@@ -4009,6 +4658,64 @@ impl Workspace {
             Key::Char('n') | Key::Char('N') | Key::Esc => {
                 self.agent_unsafe_confirm = false;
                 self.tip = Some(texts(self.language).agent_unsafe_cancelled.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_plugin_manager_key(&mut self, key: Key) {
+        match key {
+            Key::Esc => {
+                self.plugin_manager = None;
+            }
+            Key::ArrowUp => {
+                let Some(state) = self.plugin_manager.as_mut() else {
+                    return;
+                };
+
+                if state.sel > 0 {
+                    state.sel -= 1;
+                }
+            }
+            Key::ArrowDown => {
+                let Some(state) = self.plugin_manager.as_mut() else {
+                    return;
+                };
+
+                if state.sel + 1 < state.items.len() {
+                    state.sel += 1;
+                }
+            }
+            Key::Enter | Key::Char(' ') => {
+                let Some(item) = self.plugin_manager.as_ref().and_then(|state| state.items.get(state.sel)).cloned()
+                else {
+                    return;
+                };
+
+                if !item.compatible {
+                    self.tip = Some(
+                        item.compatibility_error
+                            .unwrap_or_else(|| "Plugin is not compatible".to_string()),
+                    );
+                    return;
+                }
+
+                let next_enabled = !item.enabled;
+                self.set_plugin_enabled_state(&item.id, next_enabled);
+                if let Some(state) = self.plugin_manager.as_mut() {
+                    state.items = plugins::manifest::discover_manifests();
+                    if let Some(idx) = state.items.iter().position(|m| m.id == item.id) {
+                        state.sel = idx;
+                    } else {
+                        state.sel = state.sel.min(state.items.len().saturating_sub(1));
+                    }
+                }
+
+                self.tip = Some(format!(
+                    "Plugin `{}` {}",
+                    item.id,
+                    if next_enabled { "enabled" } else { "disabled" }
+                ));
             }
             _ => {}
         }
@@ -4357,6 +5064,45 @@ impl Workspace {
         }
     }
 
+    fn render_completion_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.completion.as_ref() else {
+            return;
+        };
+
+        if rows < 3 || cols == 0 {
+            return;
+        }
+
+        let mut row = rows.saturating_sub(1);
+        let header = format!("Completion `{}`", state.prefix);
+        let mut line = truncate_str(&header, cols);
+        
+        while line.chars().count() < cols {
+            line.push(' ');
+        }
+
+        out.push_str(&format!("\x1b[{};1H\x1b[48;5;238m{}\x1b[0m", row, line));
+        row = row.saturating_sub(1);
+        for (i, item) in state.items.iter().take(6).enumerate() {
+            if row == 0 {
+                break;
+            }
+
+            let mut body = truncate_str(&format!(" {}", item), cols);
+            while body.chars().count() < cols {
+                body.push(' ');
+            }
+
+            if i == state.sel {
+                out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, body));
+            } else {
+                out.push_str(&format!("\x1b[{};1H{}", row, body));
+            }
+
+            row = row.saturating_sub(1);
+        }
+    }
+
     fn render_go_to_line_overlay(&self, out: &mut String, cols: usize, rows: usize) {
         let Some(state) = self.go_to_line.as_ref() else {
             return;
@@ -4366,7 +5112,7 @@ impl Workspace {
             return;
         }
 
-        let mut prompt = format!("Go to line: {}", state.input);
+        let mut prompt = format!("Go to line[:col]: {}", state.input);
         if prompt.chars().count() > cols {
             prompt = prompt
                 .chars()
@@ -4451,8 +5197,8 @@ impl Workspace {
         }
 
         let mut prompt = format!(
-            "Sync-edit {}x: '{}' -> '{}' (Enter apply, Esc cancel)",
-            state.occurrences, state.target, state.replacement
+            "Sync-edit {}/{}: '{}' -> '{}' (Ctrl+D next, Enter apply, Esc cancel)",
+            state.active_occurrences, state.occurrences, state.target, state.replacement
         );
 
         if prompt.chars().count() > cols {
@@ -4534,7 +5280,7 @@ impl Workspace {
             DiagnosticsFilter::Warnings => "Warnings",
         };
         let mut title = format!(
-            "Diagnostics {} / {} [{}] (F filter)",
+            "Diagnostics {} / {} [{}] (F filter, X quick-fix)",
             visible.len(),
             state.items.len(),
             filter
@@ -4559,12 +5305,11 @@ impl Workspace {
                 break;
             }
 
-            let rel = d
-                .path
-                .strip_prefix(&self.project_root)
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_else(|| d.path.to_string_lossy().to_string());
+            let rel = if let Ok(p) = d.path.strip_prefix(&self.project_root) {
+                p.to_string_lossy().to_string()
+            } else {
+                d.path.to_string_lossy().to_string()
+            };
             let mut line = format!(
                 " [{}] {}:{}:{} {}",
                 match d.severity {
@@ -4774,6 +5519,76 @@ impl Workspace {
 
         let row = (rows / 2).max(1);
         out.push_str(&format!("\x1b[{};1H\x1b[7m{}\x1b[0m", row, line));
+    }
+
+    fn render_plugin_manager_overlay(&self, out: &mut String, cols: usize, rows: usize) {
+        let Some(state) = self.plugin_manager.as_ref() else {
+            return;
+        };
+
+        if rows < 3 || cols == 0 {
+            return;
+        }
+
+        let title = "Plugins - Enter/Space toggle, Esc close";
+        let mut title_line = truncate_str(title, cols);
+        
+        while title_line.chars().count() < cols {
+            title_line.push(' ');
+        }
+
+        out.push_str(&format!("\x1b[1;1H\x1b[7m{}\x1b[0m", title_line));
+
+        let body_h = rows.saturating_sub(2);
+        let mut scroll = 0usize;
+        
+        if state.sel >= body_h {
+            scroll = state.sel + 1 - body_h;
+        }
+
+        for i in 0..body_h {
+            let idx = scroll + i;
+            if idx >= state.items.len() {
+                break;
+            }
+
+            let m = &state.items[idx];
+            let marker = if idx == state.sel { ">" } else { " " };
+            let enabled = if m.enabled { "on" } else { "off" };
+            let source = if m.builtin { "builtin" } else { "external" };
+            let compat = if m.compatible { "ok" } else { "incompatible" };
+            let line = format!("{} [{}] {:<8} {:<14} api={} {}", marker, enabled, source, m.id, m.api_version, compat);
+
+            let mut clipped = truncate_str(&line, cols);
+            while clipped.chars().count() < cols {
+                clipped.push(' ');
+            }
+
+            out.push_str(&format!("\x1b[{};1H", i + 2));
+            if idx == state.sel {
+                out.push_str("\x1b[7m");
+            }
+
+            out.push_str(&clipped);
+            out.push_str("\x1b[0m");
+        }
+
+        if let Some(sel) = state.items.get(state.sel) {
+            let footer = if let Some(err) = &sel.compatibility_error {
+                format!("{}: {}", sel.name, err)
+            } else {
+                format!("{} v{} ({})", sel.name, sel.version, sel.id)
+            };
+
+            let mut clipped = truncate_str(&footer, cols);
+            while clipped.chars().count() < cols {
+                clipped.push(' ');
+            }
+
+            out.push_str(&format!("\x1b[{};1H\x1b[2m", rows));
+            out.push_str(&clipped);
+            out.push_str("\x1b[0m");
+        }
     }
 
     fn render_search_replace_preview(&self, hit: &SearchMatch) -> Option<String> {
@@ -5119,6 +5934,27 @@ fn whole_word_regex(word: &str) -> Option<Regex> {
     Regex::new(&pat).ok()
 }
 
+fn parse_line_col_input(input: &str) -> Option<(usize, usize)> {
+    let t = input.trim();
+    if t.is_empty() {
+        return None;
+    }
+
+    let (line_s, col_s) = if let Some((l, c)) = t.split_once(':') {
+        (l.trim(), Some(c.trim()))
+    } else {
+        (t, None)
+    };
+
+    let line = line_s.parse::<usize>().ok()?.max(1);
+    let col = col_s
+        .and_then(|c| c.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+
+    Some((line.saturating_sub(1), col.saturating_sub(1)))
+}
+
 fn apply_ligatures(line: &str, enabled: bool) -> String {
     if !enabled {
         return line.to_string();
@@ -5128,6 +5964,54 @@ fn apply_ligatures(line: &str, enabled: bool) -> String {
         .replace("!=", "≠")
         .replace(">=", "≥")
         .replace("<=", "≤")
+}
+
+fn highlight_in_file_matches_ansi(line: &str, query: &str, selected_start: Option<usize>) -> String {
+    if query.is_empty() {
+        return line.to_string();
+    }
+
+    let needle: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+    if needle.is_empty() {
+        return line.to_string();
+    }
+
+    let chars: Vec<char> = line.chars().collect();
+    if chars.len() < needle.len() {
+        return line.to_string();
+    }
+
+    let lower: Vec<char> = chars
+        .iter()
+        .copied()
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if lower.len() != chars.len() {
+        return line.to_string();
+    }
+
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        if i + needle.len() <= lower.len() && lower[i..i + needle.len()] == needle[..] {
+            if Some(i) == selected_start {
+                out.push_str("\x1b[30;43m");
+            } else {
+                out.push_str("\x1b[30;103m");
+            }
+
+            for ch in &chars[i..i + needle.len()] {
+                out.push(*ch);
+            }
+            
+            out.push_str("\x1b[0m");
+            i += needle.len();
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn is_edit_key(key: Key) -> bool {

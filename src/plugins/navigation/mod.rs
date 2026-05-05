@@ -68,6 +68,8 @@ impl WorkspacePlugin for NavigationPlugin {
             Key::CtrlBackslash => ws.open_in_file_find_seeded(),
             Key::CtrlT => ws.open_symbol_jump(),
             Key::CtrlY => ws.open_go_to_line(),
+            Key::CtrlA => ws.plugin_navigate_back(),
+            Key::CtrlZ => ws.plugin_navigate_forward(),
             _ => return false,
         }
         true

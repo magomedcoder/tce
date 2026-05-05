@@ -2,6 +2,44 @@ use std::io;
 
 use crate::core::terminal::read_timeout;
 
+/// События ввода: клавиши и мышь в режиме SGR (CSI `\x1b[<...M|m`)
+#[derive(Clone, Copy, Debug)]
+pub enum UiEvent {
+    Key(Key),
+    Mouse(MouseEvent),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MouseModifiers {
+    pub shift: bool,
+    pub alt: bool,
+    pub ctrl: bool,
+}
+
+/// Тип события указателя (xterm SGR 1006)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MouseEventKind {
+    WheelUp,
+    WheelDown,
+    LeftPress,
+    LeftDrag,
+    MiddlePress,
+    RightPress,
+    Release,
+    /// Перемещение/нескролловые коды - дальше по цепочке не обрабатываем
+    Other,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseEventKind,
+    /// Колонка терминала (1-based, как в CSI)
+    pub column: u32,
+    /// Строка терминала (1-based, как в CSI)
+    pub row: u32,
+    pub modifiers: MouseModifiers,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Key {
     Char(char),
@@ -52,16 +90,30 @@ pub enum Key {
     Esc,
 }
 
-pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
+/// Читает одно UI-событие (клавиша или SGR-мышь)
+pub fn read_ui_event(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<UiEvent>> {
     let byte = match read_one_byte(stdin_fd)? {
         Some(b) => b,
         None => return Ok(None),
     };
 
     if byte == 0x1b {
-        return parse_escape(stdin_fd);
+        return parse_escape_event(stdin_fd);
     }
 
+    decode_after_first_byte(stdin_fd, byte).map(|k| k.map(UiEvent::Key))
+}
+
+/// Совместимость: события мыши отбрасываются
+#[allow(dead_code)]
+pub fn read_key(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
+    Ok(read_ui_event(stdin_fd)?.and_then(|ev| match ev {
+        UiEvent::Key(k) => Some(k),
+        UiEvent::Mouse(_) => None,
+    }))
+}
+
+fn decode_after_first_byte(stdin_fd: std::os::unix::io::RawFd, byte: u8) -> io::Result<Option<Key>> {
     if byte == 127 {
         return Ok(Some(Key::Backspace));
     }
@@ -228,12 +280,79 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
-fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
+/// Разбор CSI SGR-мыши (`[ < Pb ; Px ; Py M|m`), `seq` - без начального ESC
+fn try_parse_sgr_mouse(seq: &[u8]) -> Option<MouseEvent> {
+    // Минимум: `[<0;0;0M` = 8 байт.
+    if seq.len() < 8 || seq[0] != b'[' || seq[1] != b'<' {
+        return None;
+    }
+
+    let body = &seq[2..];
+    let last = *body.last()?;
+    if last != b'm' && last != b'M' {
+        return None;
+    }
+
+    let inner = std::str::from_utf8(&body[..body.len().saturating_sub(1)]).ok()?;
+    let mut parts = inner.split(';');
+    let pb: u32 = parts.next()?.parse().ok()?;
+    let px: u32 = parts.next()?.parse().ok()?;
+    let py: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    let modifiers = MouseModifiers {
+        shift: (pb & 4) != 0,
+        alt: (pb & 8) != 0,
+        ctrl: (pb & 16) != 0,
+    };
+
+    let code = pb & !(4 | 8 | 16);
+    let pressed = last == b'M';
+    let motion = (code & 32) != 0;
+    let base = code & !32;
+
+    let kind = match code {
+        64 => MouseEventKind::WheelUp,
+        65 => MouseEventKind::WheelDown,
+        _ if motion => {
+            if pressed && (base & 0b11) == 0 {
+                MouseEventKind::LeftDrag
+            } else {
+                MouseEventKind::Other
+            }
+        }
+        _ if base <= 2 => {
+            if pressed {
+                match base {
+                    0 => MouseEventKind::LeftPress,
+                    1 => MouseEventKind::MiddlePress,
+                    2 => MouseEventKind::RightPress,
+                    _ => MouseEventKind::Other,
+                }
+            } else {
+                MouseEventKind::Release
+            }
+        }
+        3 if !pressed => MouseEventKind::Release,
+        _ => MouseEventKind::Other,
+    };
+
+    Some(MouseEvent {
+        kind,
+        column: px.max(1),
+        row: py.max(1),
+        modifiers,
+    })
+}
+
+fn parse_escape_event(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<UiEvent>> {
     let mut seq = Vec::<u8>::new();
     let mut scratch = [0u8; 64];
     // Первый байт после ESC в некоторых терминалах/tmux может прийти заметно позже
     let mut first_wait = true;
-    for _ in 0..6 {
+    for _ in 0..8 {
         let timeout_ms = if first_wait { 700 } else { 80 };
         let n = read_timeout(stdin_fd, &mut scratch, timeout_ms)?;
         first_wait = false;
@@ -242,13 +361,13 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
         }
 
         seq.extend_from_slice(&scratch[..n]);
-        if seq.len() > 48 {
+        if seq.len() > 96 {
             break;
         }
     }
 
     if seq.is_empty() {
-        return Ok(Some(Key::Esc));
+        return Ok(Some(UiEvent::Key(Key::Esc)));
     }
 
     // Некоторые терминалы могут добавлять лишний байт ESC в начале
@@ -257,21 +376,35 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     }
 
     if seq.is_empty() {
-        return Ok(Some(Key::Esc));
+        return Ok(Some(UiEvent::Key(Key::Esc)));
+    }
+
+    // Дочитываем SGR-мышь до финального `M`/`m`.
+    if seq.len() >= 2 && seq[0] == b'[' && seq[1] == b'<' {
+        while seq.last() != Some(&b'M') && seq.last() != Some(&b'm') && seq.len() < 128 {
+            let n = read_timeout(stdin_fd, &mut scratch, 80)?;
+            if n == 0 {
+                break;
+            }
+            seq.extend_from_slice(&scratch[..n]);
+        }
+        if let Some(m) = try_parse_sgr_mouse(&seq) {
+            return Ok(Some(UiEvent::Mouse(m)));
+        }
     }
 
     if seq[0] == b'O' && seq.len() >= 3 && seq[1] == b'5' {
-        return Ok(Some(match seq[2] {
+        return Ok(Some(UiEvent::Key(match seq[2] {
             b'D' => Key::CtrlArrowLeft,
             b'C' => Key::CtrlArrowRight,
             b'A' => Key::CtrlArrowUp,
             b'B' => Key::CtrlArrowDown,
             _ => return Ok(None),
-        }));
+        })));
     }
 
     if seq[0] == b'O' && seq.len() >= 2 {
-        return Ok(Some(match seq[1] {
+        return Ok(Some(UiEvent::Key(match seq[1] {
             b'A' => Key::ArrowUp,
             b'B' => Key::ArrowDown,
             b'C' => Key::ArrowRight,
@@ -279,7 +412,7 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
             b'H' => Key::Home,
             b'F' => Key::End,
             _ => return Ok(None),
-        }));
+        })));
     } else if seq[0] == b'O' {
         // Неполная SS3-последовательность: игнорируем эту клавишу
         return Ok(None);
@@ -296,20 +429,20 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     }
 
     if body[0] == b'Z' {
-        return Ok(Some(Key::ShiftTab));
+        return Ok(Some(UiEvent::Key(Key::ShiftTab)));
     }
 
     if let Some(k) = parse_csi_modified_arrow(body) {
-        return Ok(Some(k));
+        return Ok(Some(UiEvent::Key(k)));
     }
 
     match body[0] {
-        b'A' => return Ok(Some(Key::ArrowUp)),
-        b'B' => return Ok(Some(Key::ArrowDown)),
-        b'C' => return Ok(Some(Key::ArrowRight)),
-        b'D' => return Ok(Some(Key::ArrowLeft)),
-        b'H' => return Ok(Some(Key::Home)),
-        b'F' => return Ok(Some(Key::End)),
+        b'A' => return Ok(Some(UiEvent::Key(Key::ArrowUp))),
+        b'B' => return Ok(Some(UiEvent::Key(Key::ArrowDown))),
+        b'C' => return Ok(Some(UiEvent::Key(Key::ArrowRight))),
+        b'D' => return Ok(Some(UiEvent::Key(Key::ArrowLeft))),
+        b'H' => return Ok(Some(UiEvent::Key(Key::Home))),
+        b'F' => return Ok(Some(UiEvent::Key(Key::End))),
         _ => {}
     }
 
@@ -317,12 +450,12 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     if !body.contains(&b';') {
         if let Some(last) = body.last().copied() {
             match last {
-                b'A' => return Ok(Some(Key::ArrowUp)),
-                b'B' => return Ok(Some(Key::ArrowDown)),
-                b'C' => return Ok(Some(Key::ArrowRight)),
-                b'D' => return Ok(Some(Key::ArrowLeft)),
-                b'H' => return Ok(Some(Key::Home)),
-                b'F' => return Ok(Some(Key::End)),
+                b'A' => return Ok(Some(UiEvent::Key(Key::ArrowUp))),
+                b'B' => return Ok(Some(UiEvent::Key(Key::ArrowDown))),
+                b'C' => return Ok(Some(UiEvent::Key(Key::ArrowRight))),
+                b'D' => return Ok(Some(UiEvent::Key(Key::ArrowLeft))),
+                b'H' => return Ok(Some(UiEvent::Key(Key::Home))),
+                b'F' => return Ok(Some(UiEvent::Key(Key::End))),
                 _ => {}
             }
         }
@@ -331,19 +464,55 @@ fn parse_escape(stdin_fd: std::os::unix::io::RawFd) -> io::Result<Option<Key>> {
     if body.len() >= 2 && *body.last().unwrap_or(&0) == b'~' {
         let lead = body[0];
         match lead {
-            b'1' | b'7' => return Ok(Some(Key::Home)),
+            b'1' | b'7' => return Ok(Some(UiEvent::Key(Key::Home))),
             b'2' => return Ok(None),
-            b'3' => return Ok(Some(Key::Delete)),
-            b'4' | b'8' => return Ok(Some(Key::End)),
-            b'5' => return Ok(Some(Key::PageUp)),
-            b'6' => return Ok(Some(Key::PageDown)),
+            b'3' => return Ok(Some(UiEvent::Key(Key::Delete))),
+            b'4' | b'8' => return Ok(Some(UiEvent::Key(Key::End))),
+            b'5' => return Ok(Some(UiEvent::Key(Key::PageUp))),
+            b'6' => return Ok(Some(UiEvent::Key(Key::PageDown))),
             _ => {}
         }
     }
     Ok(None)
 }
 
-/// Стиль `ESC [ 1 ; 5 D` (xterm): последний числовой параметр перед финальным байтом — это модификатор (`5` = Ctrl)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sgr_wheel_up() {
+        let m = try_parse_sgr_mouse(b"[<64;12;34M").expect("parse");
+        assert_eq!(m.kind, MouseEventKind::WheelUp);
+        assert_eq!(m.column, 12);
+        assert_eq!(m.row, 34);
+    }
+
+    #[test]
+    fn sgr_wheel_down_ctrl() {
+        let m = try_parse_sgr_mouse(b"[<81;1;2M").expect("parse");
+        assert_eq!(m.kind, MouseEventKind::WheelDown);
+        assert!(m.modifiers.ctrl);
+    }
+
+    #[test]
+    fn sgr_left_press() {
+        let m = try_parse_sgr_mouse(b"[<0;5;6M").expect("parse");
+        assert_eq!(m.kind, MouseEventKind::LeftPress);
+        assert_eq!(m.column, 5);
+        assert_eq!(m.row, 6);
+    }
+
+    #[test]
+    fn sgr_left_drag() {
+        let m = try_parse_sgr_mouse(b"[<32;7;9M").expect("parse");
+        assert_eq!(m.kind, MouseEventKind::LeftDrag);
+        assert_eq!(m.column, 7);
+        assert_eq!(m.row, 9);
+    }
+}
+
+/// Стиль `ESC [ 1 ; 5 D` (xterm): последний числовой параметр перед финальным байтом - это модификатор (`5` = Ctrl)
 fn parse_csi_modified_arrow(body: &[u8]) -> Option<Key> {
     if body.len() < 3 {
         return None;

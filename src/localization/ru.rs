@@ -115,7 +115,6 @@ pub const TEXTS_RU: Texts = Texts {
     tip_agent_busy: "Уже выполняется запрос LLM/агента",
     tip_assistant_answer_inserted: "Ответ ассистента вставлен в документ",
     tip_open_file_first: "Сначала откройте файл",
-    tip_rust_diagnostics_rs_only: "Диагностика Rust доступна только для .rs файлов",
     tip_failed_run_rustc: "Не удалось запустить rustc",
     tip_rust_check_no_diagnostics: "Проверка Rust: диагностик нет",
     tip_rust_diagnostics_ready: "Диагностика Rust готова",

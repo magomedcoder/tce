@@ -15,6 +15,8 @@ pub struct AppSettings {
     pub font_zoom: i8,
     pub line_spacing: bool,
     pub ligatures: bool,
+    pub tab_size: usize,
+    pub insert_spaces: bool,
     pub language: Language,
     pub llm_enabled: bool,
     pub llm_base_url: String,
@@ -25,6 +27,8 @@ pub struct AppSettings {
     pub llm_attach_editor: bool,
     pub llm_snippet_lines: usize,
     pub llm_snippet_max_bytes: usize,
+    pub disabled_plugins: Vec<String>,
+    pub trusted_plugins: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -37,6 +41,8 @@ impl Default for AppSettings {
             font_zoom: 0,
             line_spacing: false,
             ligatures: false,
+            tab_size: 4,
+            insert_spaces: true,
             language: Language::En,
             llm_enabled: false,
             llm_base_url: "http://127.0.0.1:8000".to_string(),
@@ -47,6 +53,8 @@ impl Default for AppSettings {
             llm_attach_editor: true,
             llm_snippet_lines: 120,
             llm_snippet_max_bytes: 12_288,
+            disabled_plugins: Vec::new(),
+            trusted_plugins: Vec::new(),
         }
     }
 }
@@ -92,6 +100,12 @@ pub fn load_settings() -> AppSettings {
             }
             "line_spacing" => s.line_spacing = val == "true",
             "ligatures" => s.ligatures = val == "true",
+            "tab_size" => {
+                if let Ok(n) = val.parse::<usize>() {
+                    s.tab_size = n.clamp(1, 16);
+                }
+            }
+            "insert_spaces" => s.insert_spaces = val == "true",
             "llm_enabled" => s.llm_enabled = val == "true",
             "llm_base_url" => s.llm_base_url = val.to_string(),
             "llm_timeout_ms" => {
@@ -120,6 +134,22 @@ pub fn load_settings() -> AppSettings {
                 if let Ok(n) = val.parse::<usize>() {
                     s.llm_snippet_max_bytes = n.clamp(512, 128 * 1024);
                 }
+            }
+            "disabled_plugins" => {
+                s.disabled_plugins = val
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+            }
+            "trusted_plugins" => {
+                s.trusted_plugins = val
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
             }
             "language" => {
                 s.language = if val.eq_ignore_ascii_case("ru") {
@@ -150,8 +180,10 @@ pub fn save_settings(s: &AppSettings) -> io::Result<()> {
     };
     
     let escaped_prompt = s.llm_system_prompt.replace('\n', "\\n");
+    let disabled_plugins = s.disabled_plugins.join(",");
+    let trusted_plugins = s.trusted_plugins.join(",");
     let body = format!(
-        "sidebar_visible={}\nright_panel_visible={}\ndark_theme={}\nautosave_on_edit={}\nfont_zoom={}\nline_spacing={}\nligatures={}\nlanguage={}\nllm_enabled={}\nllm_base_url={}\nllm_timeout_ms={}\nllm_system_prompt={}\nllm_generate_max_tokens={}\nllm_generate_temperature={}\nllm_attach_editor={}\nllm_snippet_lines={}\nllm_snippet_max_bytes={}\n",
+        "sidebar_visible={}\nright_panel_visible={}\ndark_theme={}\nautosave_on_edit={}\nfont_zoom={}\nline_spacing={}\nligatures={}\ntab_size={}\ninsert_spaces={}\nlanguage={}\nllm_enabled={}\nllm_base_url={}\nllm_timeout_ms={}\nllm_system_prompt={}\nllm_generate_max_tokens={}\nllm_generate_temperature={}\nllm_attach_editor={}\nllm_snippet_lines={}\nllm_snippet_max_bytes={}\ndisabled_plugins={}\ntrusted_plugins={}\n",
         s.sidebar_visible,
         s.right_panel_visible,
         s.dark_theme,
@@ -159,6 +191,8 @@ pub fn save_settings(s: &AppSettings) -> io::Result<()> {
         s.font_zoom,
         s.line_spacing,
         s.ligatures,
+        s.tab_size,
+        s.insert_spaces,
         language,
         s.llm_enabled,
         s.llm_base_url,
@@ -168,7 +202,9 @@ pub fn save_settings(s: &AppSettings) -> io::Result<()> {
         s.llm_generate_temperature,
         s.llm_attach_editor,
         s.llm_snippet_lines,
-        s.llm_snippet_max_bytes
+        s.llm_snippet_max_bytes,
+        disabled_plugins,
+        trusted_plugins
     );
 
     fs::write(path, body)?;

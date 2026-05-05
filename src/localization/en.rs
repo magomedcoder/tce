@@ -115,7 +115,6 @@ pub const TEXTS_EN: Texts = Texts {
     tip_agent_busy: "Another LLM/Agent request is already running",
     tip_assistant_answer_inserted: "Assistant answer inserted into document",
     tip_open_file_first: "Open a file first",
-    tip_rust_diagnostics_rs_only: "Rust diagnostics are available for .rs files",
     tip_failed_run_rustc: "Failed to run rustc",
     tip_rust_check_no_diagnostics: "Rust check: no diagnostics",
     tip_rust_diagnostics_ready: "Rust diagnostics ready",
